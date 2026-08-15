@@ -36,13 +36,30 @@ does not change.
 ## Quickstart
 
 ```bash
-uv venv --python 3.11
-uv pip install -r requirements-dev.txt
+uv sync                             # creates .venv and installs from uv.lock
 
-.venv/bin/python -m pytest          # 147 tests, no keys needed (HTTP is mocked)
-.venv/bin/python -m ruff check .
+uv run pytest                       # 147 tests, no keys needed (HTTP is mocked)
+uv run ruff check .
+uv run uvicorn app.main:app --reload
+```
+
+`uv run` resolves the environment itself — no activation step, and no way to
+accidentally run against a system or conda Python. `uv sync` even fetches the
+right interpreter if you don't have it.
+
+<details>
+<summary>Without uv (pip)</summary>
+
+```bash
+python3.11 -m venv .venv
+.venv/bin/pip install -r requirements-dev.txt
+
+.venv/bin/python -m pytest
 .venv/bin/python -m uvicorn app.main:app --reload
 ```
+
+Keep the `.venv/bin/python -m` prefix — see the troubleshooting note below.
+</details>
 
 To search **real flights, hotels, activities and restaurants**, add free
 Amadeus Self-Service credentials to `.env`:
@@ -77,24 +94,35 @@ curl -X POST http://127.0.0.1:8000/plan-trip \
 
 Interactive docs at <http://127.0.0.1:8000/docs>.
 
-### Run it from the venv, not a global Python
+### Troubleshooting: `Router.__init__() got an unexpected keyword argument 'on_startup'`
 
-Always invoke through `.venv/bin/python -m …` (or `source .venv/bin/activate`
-first). A bare `uvicorn app.main:app` picks up whatever Python is on `PATH` —
-often a conda base environment — and that fails before any project code loads:
+You are running a **different Python than the project's**, almost always a
+conda base environment picked up from `PATH` by a bare `uvicorn app.main:app`.
+The crash happens inside FastAPI's own `applications.py`, before any project
+code loads, which makes an environment problem look like an app bug.
 
-```
-TypeError: Router.__init__() got an unexpected keyword argument 'on_startup'
-```
+The cause is a FastAPI/Starlette mismatch: FastAPI below 0.141 passes
+`on_startup` to Starlette's `Router.__init__`, and Starlette 1.x removed that
+argument. Both pinned files here resolve to a working pair.
 
-That is a **FastAPI/Starlette version mismatch in the ambient environment**, not
-a bug here: FastAPI below 0.141 passes `on_startup` to Starlette's `Router`,
-which Starlette 1.x removed. `requirements.txt` pins a floor that avoids the
-pair, but only inside the venv. Check what you are actually running with:
+`uv run …` makes this impossible. If you are not using uv, keep the
+`.venv/bin/python -m` prefix, and check what you are actually running:
 
 ```bash
-.venv/bin/python -c "import fastapi, starlette; print(fastapi.__version__, starlette.__version__)"
-# expect 0.141.1 1.6.0 or newer
+uv run python -c "import fastapi, starlette; print(fastapi.__version__, starlette.__version__)"
+# expect 0.141.1 1.6.0
+```
+
+### Dependency files
+
+`pyproject.toml` is the source of truth. `uv.lock` pins the exact resolution and
+is committed, so `uv sync` is reproducible. The two `requirements*.txt` files
+are **generated** — for the Docker build in Milestone 8 and for anyone without
+uv. Regenerate them after changing a dependency:
+
+```bash
+uv export --no-hashes --no-dev --no-emit-project -o requirements.txt
+uv export --no-hashes --no-emit-project -o requirements-dev.txt
 ```
 
 ## The graph
