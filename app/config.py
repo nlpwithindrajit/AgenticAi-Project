@@ -25,10 +25,25 @@ class Settings(BaseSettings):
 
     # --- LLM (Milestone 2 onwards) --------------------------------------
     anthropic_api_key: str | None = None
-    llm_model: str = "claude-sonnet-5"
+    llm_model: str = "claude-opus-5"
+    llm_effort: str = "medium"
 
-    # --- Travel APIs (Milestones 2-4) -----------------------------------
-    flight_api_key: str | None = None
+    @property
+    def llm_enabled(self) -> bool:
+        return bool(self.anthropic_api_key)
+
+    # --- Amadeus Self-Service (flights, Milestone 2) --------------------
+    # Test env has limited inventory; switch the base URL for production.
+    amadeus_client_id: str | None = None
+    amadeus_client_secret: str | None = None
+    amadeus_base_url: str = "https://test.api.amadeus.com"
+    amadeus_timeout_seconds: float = 20.0
+
+    @property
+    def amadeus_enabled(self) -> bool:
+        return bool(self.amadeus_client_id and self.amadeus_client_secret)
+
+    # --- Travel APIs (Milestones 3-4) -----------------------------------
     hotel_api_key: str | None = None
     places_api_key: str | None = None
     maps_api_key: str | None = None

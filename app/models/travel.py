@@ -73,21 +73,73 @@ class DestinationInfo(BaseModel):
     notes: str | None = None
 
 
-class FlightOption(BaseModel):
-    """A ranked flight recommendation. `score` explains why it was chosen."""
+class FlightSegment(BaseModel):
+    """One physical flight leg (a single aircraft, a single flight number)."""
 
-    airline: str
+    carrier_code: str
+    carrier_name: str | None = None
     flight_number: str | None = None
+    aircraft: str | None = None
     origin: str
     destination: str
-    departure: str
-    arrival: str
+    departure_at: str
+    arrival_at: str
     duration_minutes: int | None = None
-    stops: int = 0
+
+
+class FlightSlice(BaseModel):
+    """One direction of a journey (outbound or return), made of segments."""
+
+    origin: str
+    destination: str
+    departure_at: str
+    arrival_at: str
+    duration_minutes: int | None = None
+    segments: list[FlightSegment] = Field(default_factory=list)
+
+    @property
+    def stops(self) -> int:
+        """Connections in this direction — a two-segment slice is one stop."""
+        return max(len(self.segments) - 1, 0)
+
+
+class FlightOption(BaseModel):
+    """One bookable offer: outbound (+ return) at a single total price.
+
+    Amadeus returns a round trip as ONE offer carrying two itineraries, so this
+    is the unit the Budget agent must cost — summing the whole recommendation
+    list would charge the traveller for every alternative we considered.
+    """
+
+    offer_id: str | None = None
+    airline: str
+    airline_name: str | None = None
+
+    outbound: FlightSlice
+    inbound: FlightSlice | None = None
+
     price: float
+    """Total for all travellers, both directions."""
+    price_per_traveler: float | None = None
     currency: str = "INR"
+
     score: float = 0.0
     rationale: str | None = None
+    source: Literal["amadeus", "stub"] = "amadeus"
+
+    @property
+    def stops(self) -> int:
+        """Worst-case connections across the journey."""
+        return max(
+            self.outbound.stops,
+            self.inbound.stops if self.inbound is not None else 0,
+        )
+
+    @property
+    def total_duration_minutes(self) -> int:
+        return (self.outbound.duration_minutes or 0) + (
+            self.inbound.duration_minutes or 0 if self.inbound is not None else 0
+        )
 
 
 class HotelOption(BaseModel):

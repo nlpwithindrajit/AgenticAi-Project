@@ -57,6 +57,37 @@ def test_end_to_end_run_produces_a_complete_plan(
     )
 
 
+def test_budget_costs_only_the_chosen_flight_offer(
+    sample_request: TravelRequest,
+) -> None:
+    """Recommendations are alternatives — billing all of them is a real bug."""
+    plan = plan_trip(sample_request)
+
+    assert len(plan.flight_recommendations) > 1, "need alternatives to test this"
+    assert plan.budget is not None
+    assert plan.budget.breakdown.flights == plan.flight_recommendations[0].price
+    assert plan.budget.breakdown.flights < sum(
+        f.price for f in plan.flight_recommendations
+    )
+
+
+def test_stub_flights_are_labelled_and_explained(
+    sample_request: TravelRequest,
+) -> None:
+    """With no Amadeus credentials the plan must admit the flights are fake."""
+    plan = plan_trip(sample_request)
+
+    assert all(f.source == "stub" for f in plan.flight_recommendations)
+    assert any("Amadeus not configured" in error for error in plan.errors)
+
+
+def test_stub_flight_offers_vary_in_stops(sample_request: TravelRequest) -> None:
+    """The ranker needs offers that actually differ, or scoring is meaningless."""
+    plan = plan_trip(sample_request)
+    stop_counts = {f.stops for f in plan.flight_recommendations}
+    assert len(stop_counts) > 1
+
+
 def test_itinerary_days_are_chronological(sample_request: TravelRequest) -> None:
     plan = plan_trip(sample_request)
     for day in plan.daily_itinerary:

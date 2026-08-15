@@ -13,8 +13,11 @@ this module should ever be mistaken for a real search result.
 
 from __future__ import annotations
 
+import logging
 from datetime import timedelta
 
+from app.agents.flight import FlightAgent
+from app.config import get_settings
 from app.graph.state import (
     MAX_BUDGET_RETRIES,
     MAX_REVIEW_RETRIES,
@@ -27,6 +30,8 @@ from app.models.travel import (
     DayPlan,
     DestinationInfo,
     FlightOption,
+    FlightSegment,
+    FlightSlice,
     HotelOption,
     ItineraryItem,
     Restaurant,
@@ -35,6 +40,9 @@ from app.models.travel import (
     TransportLeg,
     TripRequirements,
 )
+from app.tools.flights import FlightSearchError, rank_flights
+
+logger = logging.getLogger(__name__)
 
 # Share of the user's budget each category is assumed to consume in the stub
 # costing model. These deliberately sum to >1.0 so a default request trips the
@@ -108,10 +116,11 @@ def destination_node(state: TravelState) -> TravelState:
     return {"destination_info": info}
 
 
-def flight_node(state: TravelState) -> TravelState:
-    """Flight agent — search -> filter -> rank -> recommend.
+def _stub_flight_offers(state: TravelState) -> list[FlightOption]:
+    """Placeholder inventory, used only when Amadeus is not configured.
 
-    Milestone 2 replaces the body with a real flight-search tool client.
+    Returns three alternatives so the graph exercises the same "pick the top
+    ranked offer" path it takes with real data.
     """
     request = state["request"]
     discount = (
@@ -119,34 +128,112 @@ def flight_node(state: TravelState) -> TravelState:
         if state.get("cheaper_target") == "flight"
         else 1.0
     )
-    total = request.budget * _STUB_BUDGET_SHARE["flights"] * max(discount, 0.3)
+    best_price = request.budget * _STUB_BUDGET_SHARE["flights"] * max(discount, 0.3)
+    destination = request.destinations[0]
 
-    outbound = FlightOption(
-        airline="STUB-AIR",
-        flight_number="SA-100",
-        origin=request.origin,
-        destination=request.destinations[0],
-        departure=f"{request.departure_date.isoformat()}T09:00",
-        arrival=f"{request.departure_date.isoformat()}T18:00",
-        duration_minutes=540,
-        stops=0 if request.direct_flights_only else 1,
-        price=round(total / 2, 2),
-        currency=request.currency,
-        score=90.0,
-        rationale="STUB ranking: placeholder until the flight API is wired up",
-    )
-    inbound = outbound.model_copy(
-        update={
-            "flight_number": "SA-101",
-            "origin": request.destinations[-1],
-            "destination": request.origin,
-            "departure": f"{request.return_date.isoformat()}T20:00",
-            "arrival": f"{request.return_date.isoformat()}T23:59",
-        }
+    def _slice(
+        origin: str, dest: str, day: str, stops: int, minutes: int
+    ) -> FlightSlice:
+        # stops connections means stops + 1 segments.
+        return FlightSlice(
+            origin=origin,
+            destination=dest,
+            departure_at=f"{day}T09:00:00",
+            arrival_at=f"{day}T18:00:00",
+            duration_minutes=minutes,
+            segments=[
+                FlightSegment(
+                    carrier_code="ZZ",
+                    carrier_name="STUB Airways",
+                    flight_number=f"ZZ{100 + leg}",
+                    origin=origin,
+                    destination=dest,
+                    departure_at=f"{day}T09:00:00",
+                    arrival_at=f"{day}T18:00:00",
+                    duration_minutes=minutes // (stops + 1),
+                )
+                for leg in range(stops + 1)
+            ],
+        )
+
+    offers: list[FlightOption] = []
+    for index in range(3):
+        # Cheapest option is non-stop; alternatives add connections and time,
+        # so the ranker has something real to discriminate on.
+        stops = index
+        minutes = 540 + index * 90
+        price = round(best_price * (1 + 0.12 * index), 2)
+        offers.append(
+            FlightOption(
+                offer_id=f"stub-{index}",
+                airline="ZZ",
+                airline_name="STUB Airways",
+                outbound=_slice(
+                    request.origin,
+                    destination,
+                    request.departure_date.isoformat(),
+                    stops,
+                    minutes,
+                ),
+                inbound=_slice(
+                    destination,
+                    request.origin,
+                    request.return_date.isoformat(),
+                    stops,
+                    minutes,
+                ),
+                price=price,
+                price_per_traveler=round(price / request.travelers, 2),
+                currency=request.currency,
+                source="stub",
+            )
+        )
+
+    return offers
+
+
+def flight_node(state: TravelState) -> TravelState:
+    """Flight agent — search -> filter -> rank -> recommend (never book).
+
+    Uses Amadeus when credentials are configured. Without them, or when the
+    provider errors, it falls back to clearly-labelled STUB inventory and
+    records why in `state["errors"]` — the graph keeps running, but nothing
+    silently passes fake flights off as a real search.
+    """
+    request = state["request"]
+    errors = list(state.get("errors", []))
+    settings = get_settings()
+
+    if settings.amadeus_enabled:
+        try:
+            result = FlightAgent().run(request)
+            errors.extend(result.notes)
+            if result.recommendations:
+                return {
+                    "flight_results": [
+                        f.model_dump() for f in result.recommendations
+                    ],
+                    "flight_recommendations": result.recommendations,
+                    "errors": errors,
+                }
+            errors.append("flight search returned no offers; using STUB inventory")
+        except FlightSearchError as exc:
+            errors.append(f"flight search failed ({exc}); using STUB inventory")
+        except Exception as exc:  # pragma: no cover - unexpected provider fault
+            logger.exception("unexpected flight search failure")
+            errors.append(f"flight search error ({exc}); using STUB inventory")
+    else:
+        errors.append("Amadeus not configured; using STUB flight inventory")
+
+    ranked = rank_flights(
+        _stub_flight_offers(state),
+        preferred_airline=request.preferred_airline,
+        top_n=3,
     )
     return {
-        "flight_results": [outbound.model_dump(), inbound.model_dump()],
-        "flight_recommendations": [outbound, inbound],
+        "flight_results": [f.model_dump() for f in ranked],
+        "flight_recommendations": ranked,
+        "errors": errors,
     }
 
 
@@ -276,8 +363,14 @@ def budget_node(state: TravelState) -> TravelState:
     """Budget agent — totals every category and compares against the budget."""
     request = state["request"]
 
+    # Flight recommendations are ALTERNATIVES, not legs — cost only the top
+    # ranked offer, whose price already covers every traveller and both
+    # directions. Summing the list would bill the trip for options we rejected.
+    flights = state.get("flight_recommendations", [])
+    flight_cost = flights[0].price if flights else 0.0
+
     breakdown = BudgetBreakdown(
-        flights=sum(f.price for f in state.get("flight_recommendations", [])),
+        flights=flight_cost,
         hotels=sum(h.total_price for h in state.get("hotel_recommendations", [])),
         activities=sum(a.estimated_cost for a in state.get("activities", [])),
         restaurants=sum(r.price_estimate for r in state.get("restaurants", [])),
@@ -314,20 +407,25 @@ def itinerary_node(state: TravelState) -> TravelState:
     activities = {a.recommended_day: a for a in state.get("activities", [])}
     restaurants = {r.recommended_day: r for r in state.get("restaurants", [])}
     flights = state.get("flight_recommendations", [])
+    # The itinerary follows the ONE offer we recommend, not the alternatives.
+    chosen = flights[0] if flights else None
 
     days: list[DayPlan] = []
     for index, destination in enumerate(schedule):
         day_number = index + 1
         day_date = request.departure_date + timedelta(days=index)
         is_last_day = day_number == len(schedule)
-        has_return_flight = is_last_day and len(flights) > 1
+        has_return_flight = is_last_day and chosen is not None and chosen.inbound
         items: list[ItineraryItem] = []
 
-        if day_number == 1 and flights:
+        if day_number == 1 and chosen is not None:
             items.append(
                 ItineraryItem(
                     time="09:00",
-                    title=f"Flight {flights[0].origin} to {flights[0].destination}",
+                    title=(
+                        f"Flight {chosen.outbound.origin} to "
+                        f"{chosen.outbound.destination}"
+                    ),
                     kind="flight",
                 )
             )
@@ -357,11 +455,11 @@ def itinerary_node(state: TravelState) -> TravelState:
                 )
             )
 
-        if has_return_flight:
+        if has_return_flight and chosen is not None and chosen.inbound is not None:
             items.append(
                 ItineraryItem(
                     time="20:00",
-                    title=f"Return flight to {flights[-1].destination}",
+                    title=f"Return flight to {chosen.inbound.destination}",
                     kind="flight",
                 )
             )
