@@ -6,15 +6,21 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 An AI travel planner: the user submits a structured travel request (origin, destinations, dates, travelers, budget, preferences) and a multi-agent LangGraph workflow produces flight options, hotel options, a daily itinerary, restaurant suggestions, transportation, cost estimates, and an explanation of the choices.
 
-The full plan lives in `projectIdea.md` — read it before making architectural decisions. This is currently a greenfield repo: no application code exists yet.
+The full plan lives in `projectIdea.md` — read it before making architectural decisions. Note that `projectIdea.md` is the original planning document and has not been rewritten as decisions changed; where it disagrees with this file, this file is current.
 
-**Stack:** Python, LangChain + LangGraph, FastAPI, Langfuse (observability), Docker → Amazon ECR → AWS App Runner (backend), Next.js on Vercel (frontend).
+**Stack:** Python, LangChain + LangGraph, FastAPI, Langfuse (observability), Docker → Amazon ECR → Amazon ECS (Fargate) behind one Application Load Balancer, Next.js UI on the same ALB.
+
+Two deployment decisions differ from `projectIdea.md`:
+- **ECS, not App Runner.** App Runner is being wound down; ECS Fargate is the supported path.
+- **The UI runs on AWS, not Vercel** — same load balancer as the API, served at `/` while the API is served at `/api/*`. One origin means the browser never makes a cross-origin request, so CORS cannot break the deployed UI. The API answers on both `/` and `/api/*` so local development and the tests are unaffected.
+
+LLM provider is OpenAI (`LLM_PROVIDER=openai`, `OPENAI_API_KEY`); Anthropic remains supported via the same `app/agents/llm.py` seam.
 
 ## Build Order (important)
 
-Do NOT start with the frontend or deployment. The agreed first sprint is a CLI/API-driven LangGraph workflow with real flight + hotel search, structured results, and Langfuse tracing. FastAPI → Docker → App Runner → Vercel layers come after the core graph is reliable.
+Milestones 1–8 are complete. The sequence was: foundation (FastAPI skeleton + `/plan-trip` + graph) → Flight Agent → Hotel Agent → Activity/Restaurant Agents → Budget/Itinerary/Review Agents with the replanning loop → Langfuse instrumentation → Next.js UI → containerisation and AWS deployment. The original instruction to build the graph before the frontend or deployment has been followed; it is recorded here as history, not as a remaining constraint.
 
-Milestone sequence: foundation (FastAPI skeleton + basic `/plan-trip` endpoint + simple graph) → Flight Agent → Hotel Agent → Activity/Restaurant Agents → Budget/Itinerary/Review Agents with the replanning loop → Langfuse instrumentation → Vercel UI → AWS deployment.
+What is left is provisioning on a real AWS account (`deploy/provision-ecs.sh`) — everything else, including CI, is in the repo.
 
 MVP scope is deliberately narrow: one flight API, one hotel provider, one places API. No booking (search → filter → rank → recommend only), no auth, no payments, no vector DB, no memory.
 

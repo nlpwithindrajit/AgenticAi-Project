@@ -1,0 +1,93 @@
+name: test
+
+# Runs on every push and pull request. Nothing here needs a secret: the suite
+# is hermetic by design — `tests/conftest.py` disables the `.env` source and
+# clears provider keys, so no job can quietly start billing an API.
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+  # Called by deploy.yml so that no release can skip the suite.
+  workflow_call:
+
+concurrency:
+  # A newer commit on the same branch makes the older run irrelevant.
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: backend (lint + 234 tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install dependencies
+        # --frozen: fail if uv.lock is out of date with pyproject.toml rather
+        # than silently resolving something the tests never ran against.
+        run: uv sync --frozen
+
+      - name: Show what is actually installed
+        run: uv run python -c "import sys, fastapi, starlette; print(sys.version.split()[0], fastapi.__version__, starlette.__version__)"
+
+      - name: Lint
+        run: uv run ruff check .
+
+      - name: Tests
+        run: uv run pytest -q
+
+  frontend:
+    name: frontend (typecheck + build)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run build
+
+  images:
+    name: container images build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Built but not pushed: this proves the Dockerfiles still work on every
+      # change, without needing credentials on a pull request from a fork.
+      - name: Build API image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build UI image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./frontend
+          platforms: linux/amd64
+          push: false
+          build-args: |
+            NEXT_PUBLIC_API_BASE_URL=http://localhost:8000
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

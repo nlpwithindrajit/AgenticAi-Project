@@ -4,6 +4,16 @@ __pycache__/
 .ruff_cache/
 .venv/
 venv/
+# `.env` alone does not cover the copies macOS and editors leave behind —
+# ".env 2", ".env.local", ".env.bak" — and one of those turning up untracked in
+# `git status` is one `git add .` away from publishing real keys.
 .env
+.env.*
+.env[ ]*
 *.egg-info/
 .DS_Store
+
+# Rendered task definitions: the deploy scripts substitute real account IDs and
+# image digests into these. Nothing secret (secrets come from SSM), but they are
+# build output, not source.
+deploy/ecs/*.rendered.json

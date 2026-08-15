@@ -4,7 +4,8 @@
 # Override with e.g. `make dev PORT=8001` if something is stuck on 8000.
 PORT ?= 8000
 
-.PHONY: install dev serve test lint check env clean ui up down logs images
+.PHONY: install dev serve test lint check env clean ui up down logs images \
+        provision deploy deploy-api deploy-ui aws-logs
 
 install:                ## create .venv and install from uv.lock
 	uv sync
@@ -50,3 +51,22 @@ images:                 ## build both deployment images without running them
 
 clean:
 	rm -rf .venv .pytest_cache .ruff_cache
+
+# --- AWS (ECS Fargate) ------------------------------------------------------
+# `provision` creates billable infrastructure and is meant to run once.
+# `deploy` only ships new code onto it.
+
+provision:              ## ONE TIME: cluster, ALB, IAM, secrets, ECS services
+	./deploy/provision-ecs.sh
+
+deploy:                 ## build, push, roll both services, verify
+	./deploy/deploy-ecs.sh
+
+deploy-api:
+	./deploy/deploy-ecs.sh api
+
+deploy-ui:
+	./deploy/deploy-ecs.sh ui
+
+aws-logs:               ## tail the deployed API logs
+	aws logs tail /ecs/travel-planner-api --follow

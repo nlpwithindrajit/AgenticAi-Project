@@ -1,0 +1,202 @@
+name: deploy
+
+# Build both images, push to ECR, and roll the ECS Fargate services.
+#
+# Deliberately NOT automatic on every push to main. Fargate bills continuously
+# and a bad deploy is slow to reverse, so shipping stays a decision someone
+# makes: run it from the Actions tab, or push a v* tag.
+#
+# The infrastructure this deploys ONTO (cluster, load balancer, target groups,
+# IAM, SSM parameters, services) is created once by deploy/provision-ecs.sh.
+# This workflow only registers new task definition revisions and updates the
+# services — it never creates or destroys infrastructure.
+on:
+  workflow_dispatch:
+    inputs:
+      deploy_api:
+        description: Deploy the API service
+        type: boolean
+        default: true
+      deploy_ui:
+        description: Deploy the UI service
+        type: boolean
+        default: true
+  push:
+    tags: ["v*"]
+
+concurrency:
+  # Two deploys racing to the same service produce an ambiguous rollback target.
+  group: deploy-production
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  CLUSTER: travel-planner
+  API_REPO: travel-planner-api
+  UI_REPO: travel-planner-ui
+
+permissions:
+  contents: read
+  id-token: write # for the OIDC upgrade described in README.md
+
+jobs:
+  test:
+    # A red suite stops the release. `deploy` needs this job, so there is no
+    # path to production that skips it.
+    uses: ./.github/workflows/test.yml
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    environment: production # add required reviewers here for an approval gate
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          # Long-lived keys. Prefer `role-to-assume:` with GitHub OIDC — it
+          # removes the standing secret entirely. See README.md.
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Resolve the load balancer
+        id: alb
+        run: |
+          dns=$(aws elbv2 describe-load-balancers --names travel-planner-alb \
+            --query 'LoadBalancers[0].DNSName' --output text 2>/dev/null || true)
+          if [ -z "$dns" ] || [ "$dns" = "None" ]; then
+            echo "::error::No load balancer named travel-planner-alb."
+            echo "Run deploy/provision-ecs.sh once before the first deploy."
+            exit 1
+          fi
+          echo "base_url=http://${dns}" >> "$GITHUB_OUTPUT"
+
+      # ---- API ----------------------------------------------------------
+      # linux/amd64 is not optional: Fargate runs x86 here, and an arm64 image
+      # fails at start with "exec format error" buried in CloudWatch.
+      - name: Build and push the API image
+        if: inputs.deploy_api != false
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ steps.ecr.outputs.registry }}/${{ env.API_REPO }}:${{ github.sha }}
+            ${{ steps.ecr.outputs.registry }}/${{ env.API_REPO }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # ---- UI -----------------------------------------------------------
+      # NEXT_PUBLIC_ values are compiled into the client bundle, so the API URL
+      # is fixed at build time. "/api" — a relative path — is deliberate: the
+      # UI and API share one origin behind the ALB, so this stays correct even
+      # if the hostname changes, and it means no cross-origin request is ever
+      # made from the browser.
+      - name: Build and push the UI image
+        if: inputs.deploy_ui != false
+        uses: docker/build-push-action@v6
+        with:
+          context: ./frontend
+          platforms: linux/amd64
+          push: true
+          build-args: |
+            NEXT_PUBLIC_API_BASE_URL=/api
+          tags: |
+            ${{ steps.ecr.outputs.registry }}/${{ env.UI_REPO }}:${{ github.sha }}
+            ${{ steps.ecr.outputs.registry }}/${{ env.UI_REPO }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # ---- roll ----------------------------------------------------------
+      - name: Register task definitions and update services
+        env:
+          BASE_URL: ${{ steps.alb.outputs.base_url }}
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          DEPLOY_API: ${{ inputs.deploy_api != false }}
+          DEPLOY_UI: ${{ inputs.deploy_ui != false }}
+        run: |
+          set -euo pipefail
+          account=$(aws sts get-caller-identity --query Account --output text)
+          rolled=()
+
+          roll() {
+            kind="$1"
+            image="${REGISTRY}/travel-planner-${kind}:${GITHUB_SHA}"
+            # __BASE_URL__ is a bare URL; the template carries the quoting that
+            # makes ALLOWED_ORIGINS a JSON array. See deploy/ecs/README.md.
+            td=$(sed -e "s|__ACCOUNT__|${account}|g" \
+                     -e "s|__REGION__|${AWS_REGION}|g" \
+                     -e "s|__IMAGE__|${image}|g" \
+                     -e "s|__BASE_URL__|${BASE_URL}|g" \
+                     "deploy/ecs/task-def-${kind}.json")
+            arn=$(aws ecs register-task-definition --cli-input-json "$td" \
+              --query 'taskDefinition.taskDefinitionArn' --output text)
+            # --desired-count 1 explicitly, so that deploying is also how you
+            # come back from `teardown` mode=stop (which sets it to 0).
+            # Without it the deploy reports success while nothing is running.
+            aws ecs update-service --cluster "$CLUSTER" \
+              --service "travel-planner-${kind}" --task-definition "$arn" \
+              --desired-count 1 >/dev/null
+            echo "travel-planner-${kind} -> ${arn##*/}"
+            rolled+=("travel-planner-${kind}")
+          }
+
+          # if/then, not `[ ... ] && roll`: under `set -e` a false test is a
+          # non-zero exit status for the whole line, which would end the step.
+          if [ "$DEPLOY_API" = "true" ]; then roll api; fi
+          if [ "$DEPLOY_UI" = "true" ]; then roll ui; fi
+
+          if [ ${#rolled[@]} -eq 0 ]; then
+            echo "::error::Both services were deselected — nothing to deploy."
+            exit 1
+          fi
+          printf '%s\n' "${rolled[@]}" > /tmp/rolled
+
+      - name: Wait for the services to stabilise
+        run: |
+          # Fails if ECS keeps replacing tasks — which is what a container that
+          # crashes on start looks like. Better to fail here than to report a
+          # green deploy and leave the old tasks quietly serving.
+          mapfile -t services < /tmp/rolled
+          aws ecs wait services-stable --cluster "$CLUSTER" --services "${services[@]}"
+
+      - name: Verify the deployed API
+        env:
+          BASE_URL: ${{ steps.alb.outputs.base_url }}
+        run: |
+          for i in $(seq 1 20); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' "${BASE_URL}/api/health" || true)
+            if [ "$code" = "200" ]; then
+              echo "::notice::Deployed. UI ${BASE_URL} — API ${BASE_URL}/api/health"
+              exit 0
+            fi
+            echo "attempt ${i}: ${code:-no response}"
+            sleep 15
+          done
+          echo "::error::${BASE_URL}/api/health never returned 200"
+          aws logs tail /ecs/travel-planner-api --since 10m || true
+          exit 1
+
+      - name: Roll back on failure
+        if: failure()
+        run: |
+          # A failed deploy leaves the previous revision as the last stable one.
+          # This does not guess: it only reports how to go back, because an
+          # automatic rollback during a partly-applied deploy can be worse than
+          # a clear stop.
+          echo "::warning::Deploy failed. To roll back a service:"
+          echo "  aws ecs update-service --cluster $CLUSTER \\"
+          echo "    --service travel-planner-api --task-definition travel-planner-api:<previous-revision>"
+          aws ecs describe-services --cluster "$CLUSTER" \
+            --services travel-planner-api travel-planner-ui \
+            --query 'services[].{name:serviceName,taskDef:taskDefinition,running:runningCount,desired:desiredCount}' \
+            --output table || true

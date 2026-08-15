@@ -1,10 +1,13 @@
-# The whole app locally, in the same images that go to App Runner.
+# The whole app locally, in the same images that go to ECS.
 #
 #   make up      -> http://localhost:3000
 #   make down
 #
 # Keys are optional. Without them the API serves clearly-labelled STUB
 # inventory, exactly as it does outside Docker.
+#
+# Unlike the deployed setup, here the UI talks to the API on a separate port
+# and origin, so this is the configuration that actually exercises CORS.
 
 services:
   api:

@@ -11,7 +11,7 @@ from app.env_check import check_runtime
 
 check_runtime()
 
-from fastapi import FastAPI, HTTPException  # noqa: E402
+from fastapi import APIRouter, FastAPI, HTTPException  # noqa: E402
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
 from pydantic import BaseModel, Field  # noqa: E402
 
@@ -54,9 +54,12 @@ app.add_middleware(
 )
 
 
-@app.get("/health")
+router = APIRouter()
+
+
+@router.get("/health")
 def health() -> dict[str, object]:
-    """Liveness probe — also used as the App Runner health check."""
+    """Liveness probe — also the ECS target-group health check."""
     return {
         "status": "ok",
         "environment": settings.environment,
@@ -64,7 +67,7 @@ def health() -> dict[str, object]:
     }
 
 
-@app.post("/plan-trip", response_model=TripPlan)
+@router.post("/plan-trip", response_model=TripPlan)
 def plan_trip_endpoint(request: TravelRequest) -> TripPlan:
     """Run the LangGraph workflow for one structured travel request."""
     trace_id = new_trace_id()
@@ -153,7 +156,7 @@ class ChatResponse(BaseModel):
     plan: TripPlan | None = None
 
 
-@app.post("/chat", response_model=ChatResponse)
+@router.post("/chat", response_model=ChatResponse)
 def chat_endpoint(body: ChatRequest) -> ChatResponse:
     """Conversational intake that produces a structured TravelRequest.
 
@@ -188,3 +191,16 @@ def chat_endpoint(body: ChatRequest) -> ChatResponse:
     except Exception as exc:
         logger.exception("chat turn failed (trace %s)", trace_id)
         raise HTTPException(status_code=500, detail=f"chat failed: {exc}") from exc
+
+
+app.include_router(router)
+
+# The same routes again under /api. This is what lets a single load balancer
+# serve the UI at / and the API at /api/*: one origin, so the browser never
+# issues a cross-origin preflight. CORS then cannot break the deployed UI,
+# which is the failure that looks like "the site is down" while /health is
+# green and the server logs show nothing at all.
+#
+# Root-level paths stay because local development, the test suite and
+# `docker compose` all talk to the API directly on :8000.
+app.include_router(router, prefix="/api")
