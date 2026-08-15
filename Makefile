@@ -1,16 +1,19 @@
 # Every target goes through `uv run`, which uses the project venv and can never
 # fall back to a system or conda Python. Use these rather than bare `uvicorn` /
 # `pytest` commands.
-.PHONY: install dev test lint check env clean
+# Override with e.g. `make dev PORT=8001` if something is stuck on 8000.
+PORT ?= 8000
+
+.PHONY: install dev serve test lint check env clean
 
 install:                ## create .venv and install from uv.lock
 	uv sync
 
 dev:                    ## run the API with auto-reload
-	uv run uvicorn app.main:app --reload --reload-dir app
+	uv run uvicorn app.main:app --reload --reload-dir app --port $(PORT)
 
 serve:                  ## run the API without auto-reload
-	uv run uvicorn app.main:app
+	uv run uvicorn app.main:app --port $(PORT)
 
 test:
 	uv run pytest
