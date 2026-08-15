@@ -4,13 +4,20 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
+# Must run before FastAPI is constructed: on a mismatched environment the
+# constructor throws from deep inside FastAPI, and this turns that into a
+# message that names the problem. See app/env_check.py.
+from app.env_check import check_runtime
 
-from app.config import get_settings
-from app.graph.graph import plan_trip
-from app.models.travel import TravelRequest, TripPlan
-from app.services.langfuse import new_trace_id, span
+check_runtime()
+
+from fastapi import FastAPI, HTTPException  # noqa: E402
+from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
+
+from app.config import get_settings  # noqa: E402
+from app.graph.graph import plan_trip  # noqa: E402
+from app.models.travel import TravelRequest, TripPlan  # noqa: E402
+from app.services.langfuse import new_trace_id, span  # noqa: E402
 
 settings = get_settings()
 logging.basicConfig(level=settings.log_level)

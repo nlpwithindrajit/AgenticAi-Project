@@ -9,7 +9,7 @@ from __future__ import annotations
 from datetime import date
 from typing import Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, computed_field, model_validator
 
 TripStyle = Literal["relaxed", "balanced", "packed"]
 
@@ -97,6 +97,7 @@ class FlightSlice(BaseModel):
     duration_minutes: int | None = None
     segments: list[FlightSegment] = Field(default_factory=list)
 
+    @computed_field
     @property
     def stops(self) -> int:
         """Connections in this direction — a two-segment slice is one stop."""
@@ -127,6 +128,7 @@ class FlightOption(BaseModel):
     rationale: str | None = None
     source: Literal["amadeus", "stub"] = "amadeus"
 
+    @computed_field
     @property
     def stops(self) -> int:
         """Worst-case connections across the journey."""
@@ -135,6 +137,7 @@ class FlightOption(BaseModel):
             self.inbound.stops if self.inbound is not None else 0,
         )
 
+    @computed_field
     @property
     def total_duration_minutes(self) -> int:
         return (self.outbound.duration_minutes or 0) + (
@@ -284,6 +287,7 @@ class BudgetBreakdown(BaseModel):
     transportation: float = 0.0
     currency: str = "INR"
 
+    @computed_field
     @property
     def estimated_total(self) -> float:
         return (
