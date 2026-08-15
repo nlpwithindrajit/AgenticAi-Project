@@ -21,7 +21,20 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
 
     # CORS origins for the Next.js frontend (Milestone 7).
-    allowed_origins: list[str] = ["http://localhost:3000"]
+    # Browser origins allowed to call this API. A missing origin is not a
+    # gentle degradation: the browser blocks the request outright and the UI
+    # simply cannot talk to the API, so the deployed UI's URL MUST be listed
+    # here in production. Both loopback spellings are included because
+    # localhost and 127.0.0.1 are distinct origins to a browser.
+    allowed_origins: list[str] = [
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ]
+
+    @property
+    def cors_is_default(self) -> bool:
+        """True when nothing was configured — worth warning about off-local."""
+        return all("localhost" in o or "127.0.0.1" in o for o in self.allowed_origins)
 
     # --- LLM (Milestone 2 onwards) --------------------------------------
     anthropic_api_key: str | None = None

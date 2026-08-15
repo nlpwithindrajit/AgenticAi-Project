@@ -7,7 +7,7 @@ costed budget — with an explanation of why each option was chosen.
 Full design: [`projectIdea.md`](./projectIdea.md). Working agreements:
 [`CLAUDE.md`](./CLAUDE.md).
 
-## Status — Milestones 1-6 complete
+## Status — Milestones 1-8 complete
 
 What is **real**:
 
@@ -25,6 +25,10 @@ What is **real**:
   what the next pass actually searches for
 - **Langfuse tracing**: one trace per request, a span per agent, per Amadeus
   call and per LLM call, with review and budget scores
+- **A Next.js UI** — structured trip form, budget meter, flight and hotel
+  cards, day-by-day itinerary, and the plan's own caveats surfaced rather than
+  hidden
+- **Container images and an AWS deploy path** for both services
 - `POST /plan-trip` and `GET /health` on FastAPI
 - Retry-bounded loops, so a bad edit fails loudly instead of hanging
 
@@ -37,9 +41,16 @@ falls back to stub inventory *and says so in `TripPlan.errors`*.
 ## Quickstart
 
 ```bash
+make up      # everything in Docker — UI on :3000, API on :8000
+```
+
+Or run the pieces directly:
+
+```bash
 make install                        # uv sync — creates .venv from uv.lock
 make test                           # 210 tests, no keys needed (HTTP is mocked)
 make dev                            # API with auto-reload on :8000
+make ui                             # Next.js UI on :3000
 ```
 
 `make env` prints which interpreter and package versions are actually in use —
@@ -375,6 +386,58 @@ Two properties are enforced by tests rather than hoped for:
   cost is up to `LANGFUSE_TIMEOUT_SECONDS` of flush, which is why that is
   bounded and configurable.
 
+### The UI (Milestone 7)
+
+`frontend/` is a Next.js app (App Router, TypeScript). It collects a
+**structured `TravelRequest`** rather than free text, so the agents consume the
+schema with no parsing step to get wrong.
+
+The interesting design constraint is that **the UI must not launder the
+backend's honesty**. The API is careful to distinguish a quoted price from an
+estimate, and a live search from stub inventory; a pretty UI that dropped those
+distinctions would undo that work. So:
+
+- anything with `source: "stub"` carries a **stub** badge
+- restaurant prices carry an **estimated** badge, with the basis on hover
+- activities with no published price show **no price**, not a fake zero
+- flights and hotels say plainly that they are *alternatives*, and only the best
+  is counted in the budget
+- the plan's own notes (`TripPlan.errors`) get their own panel:
+  *"What this plan says about itself"*
+
+The loading state lists the agents in order but does **not** claim live
+per-agent progress: `/plan-trip` is one request/response, so the UI cannot know
+which agent is running, and animating it would be theatre. Real per-agent ticks
+need a streaming endpoint — a natural follow-up.
+
+### Deployment (Milestone 8)
+
+Both services are containerised for **Amazon ECR → AWS App Runner** (the UI
+runs on AWS too, rather than Vercel).
+
+```bash
+make images            # build both images without running them
+make up                # run the whole stack locally in those same images
+./deploy/deploy-aws.sh # build for linux/amd64, push both to ECR
+```
+
+Verified locally: API image 269 MB, UI image 230 MB, both reporting healthy,
+serving a complete plan across the container boundary.
+
+Three things that bite, all handled or flagged by the deploy script:
+
+1. **CORS is not a soft failure.** If `ALLOWED_ORIGINS` does not contain the
+   UI's real URL, the browser blocks every request — the UI looks broken while
+   the API reports healthy, and there is no server-side error to find. The API
+   logs a warning at startup if this is still the localhost default outside
+   `local`.
+2. **The API URL is compiled into the UI.** `NEXT_PUBLIC_*` is inlined at build
+   time, so an App Runner environment variable set afterwards does nothing —
+   changing the API URL means rebuilding and repushing the UI image.
+3. **App Runner does not run arm64.** Building on an Apple Silicon Mac without
+   `--platform linux/amd64` yields a service that never goes healthy, with
+   nothing useful in the logs. The script forces the platform.
+
 ## Configuration
 
 Copy `.env.example` to `.env`. Nothing in it is required to run the graph —
@@ -392,8 +455,8 @@ fallbacks to real reasoning; every one of them works without it.
 | 4 | Activity + Restaurant Agents | done |
 | 5 | Budget / Itinerary / Review agents + replanning loop | done |
 | 6 | Langfuse instrumentation | done |
-| 7 | Next.js UI on Vercel | next |
-| 8 | Docker → ECR → AWS App Runner | |
+| 7 | Next.js UI (on AWS, not Vercel) | done |
+| 8 | Docker → ECR → AWS App Runner | images done, deploy needs your AWS account |
 
 MVP scope stays narrow: one flight API, one hotel provider, one places API.
 Search → filter → rank → recommend. No booking, no auth, no payments.

@@ -34,6 +34,15 @@ app = FastAPI(
     description="Multi-agent LangGraph trip planning (search -> rank -> recommend).",
 )
 
+if settings.environment != "local" and settings.cors_is_default:
+    # A CORS misconfiguration presents as "the UI is broken" with a healthy
+    # API and no server-side error, which is expensive to diagnose. Say it now.
+    logger.warning(
+        "ALLOWED_ORIGINS is still the localhost default in environment %r — "
+        "a deployed browser UI will be blocked. Set it to the UI's URL.",
+        settings.environment,
+    )
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.allowed_origins,

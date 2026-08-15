@@ -1,0 +1,46 @@
+# The whole app locally, in the same images that go to App Runner.
+#
+#   make up      -> http://localhost:3000
+#   make down
+#
+# Keys are optional. Without them the API serves clearly-labelled STUB
+# inventory, exactly as it does outside Docker.
+
+services:
+  api:
+    build:
+      context: .
+    ports:
+      - "${API_PORT:-8000}:8000"
+    environment:
+      ENVIRONMENT: docker
+      # The UI's origin. A browser blocks the call outright if this is wrong,
+      # which looks like a broken UI rather than a config error.
+      ALLOWED_ORIGINS: '["http://localhost:${UI_PORT:-3000}","http://127.0.0.1:${UI_PORT:-3000}"]'
+      AMADEUS_CLIENT_ID: ${AMADEUS_CLIENT_ID:-}
+      AMADEUS_CLIENT_SECRET: ${AMADEUS_CLIENT_SECRET:-}
+      AMADEUS_BASE_URL: ${AMADEUS_BASE_URL:-https://test.api.amadeus.com}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      LLM_MODEL: ${LLM_MODEL:-claude-opus-5}
+      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
+      LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
+      LANGFUSE_HOST: ${LANGFUSE_HOST:-https://cloud.langfuse.com}
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  ui:
+    build:
+      context: ./frontend
+      args:
+        # Baked into the client bundle at build time — the browser cannot read
+        # a runtime env var, so changing the API URL means rebuilding the image.
+        NEXT_PUBLIC_API_BASE_URL: http://localhost:${API_PORT:-8000}
+    ports:
+      - "${UI_PORT:-3000}:3000"
+    depends_on:
+      api:
+        condition: service_healthy
