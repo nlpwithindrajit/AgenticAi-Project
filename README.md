@@ -48,7 +48,7 @@ Or run the pieces directly:
 
 ```bash
 make install                        # uv sync — creates .venv from uv.lock
-make test                           # 210 tests, no keys needed (HTTP is mocked)
+make test                           # 233 tests, no keys needed (HTTP is mocked)
 make dev                            # API with auto-reload on :8000
 make ui                             # Next.js UI on :3000
 ```
@@ -409,6 +409,32 @@ The loading state lists the agents in order but does **not** claim live
 per-agent progress: `/plan-trip` is one request/response, so the UI cannot know
 which agent is running, and animating it would be theatre. Real per-agent ticks
 need a streaming endpoint — a natural follow-up.
+
+### Chat intake
+
+`POST /chat` accepts a sentence and returns a `TravelRequest`, asking for
+anything missing. The UI offers it as "Describe it" alongside the form.
+
+`CLAUDE.md` requires the agents to consume a structured schema rather than free
+text, and that stays true: chat is a **front door that produces the schema**,
+not a bypass. The same graph runs either way.
+
+The rule that matters is that **nothing is guessed into a required field**. A
+message with no budget gets a question, not an invented number that would
+otherwise drive every search and the entire budget loop. Where a default does
+apply — an unstated return date becomes five days — it is said out loud in the
+reply.
+
+Two extraction paths:
+
+| | reads |
+|---|---|
+| with `ANTHROPIC_API_KEY` | relative dates, loose phrasing, "a long weekend" |
+| without | clear phrasings only: explicit `to`/`from`, ISO or `Oct 10-15` dates, `2 lakh` / `200k` / `₹2,00,000` |
+
+The fallback keeps the feature usable with no key at all, matching the rest of
+the project. It is narrow on purpose, the UI labels it **rule-based**, and its
+limits are pinned by tests rather than glossed over.
 
 ### Deployment (Milestone 8)
 

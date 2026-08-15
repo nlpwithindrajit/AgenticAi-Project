@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import Chat from "./Chat";
 import Results from "./Results";
 import TripForm from "./TripForm";
 import { API_BASE, ApiError, planTrip } from "@/lib/api";
@@ -29,6 +30,7 @@ export default function Home() {
   const [plan, setPlan] = useState<TripPlan | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [mode, setMode] = useState<"chat" | "form">("chat");
 
   async function run(request: TravelRequest) {
     setBusy(true);
@@ -47,7 +49,35 @@ export default function Home() {
 
   return (
     <>
-      <TripForm onSubmit={run} busy={busy} />
+      <div className="chips" style={{ marginBottom: 16 }}>
+        <button
+          type="button"
+          className="chip"
+          aria-pressed={mode === "chat"}
+          onClick={() => setMode("chat")}
+        >
+          Describe it
+        </button>
+        <button
+          type="button"
+          className="chip"
+          aria-pressed={mode === "form"}
+          onClick={() => setMode("form")}
+        >
+          Fill in a form
+        </button>
+      </div>
+
+      {mode === "chat" ? (
+        <Chat
+          onPlan={(p) => {
+            setError(null);
+            setPlan(p);
+          }}
+        />
+      ) : (
+        <TripForm onSubmit={run} busy={busy} />
+      )}
 
       {busy && (
         <div className="card">
