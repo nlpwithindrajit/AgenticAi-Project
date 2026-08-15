@@ -215,6 +215,71 @@ def test_budget_loop_brings_the_plan_under_budget(
     assert plan.review is not None and plan.review.verdict == "PASS"
 
 
+def test_budget_pressure_tightens_the_next_search(
+    sample_request: TravelRequest,
+) -> None:
+    """A replan must search cheaper, not re-run the identical search."""
+    state = initial_state(sample_request)
+    assert state["cost_pressure"] == 1.0
+
+    baseline = nodes._stub_flight_offers(state)
+    state["cost_pressure"] = 0.6
+    pressured = nodes._stub_flight_offers(state)
+
+    assert pressured[0].price < baseline[0].price
+
+
+def test_review_failure_records_actionable_guidance() -> None:
+    """Three cities in one day cannot work; the loop must say what to change."""
+    request = TravelRequest(
+        origin="Mumbai",
+        destinations=["Tokyo", "Kyoto", "Osaka"],
+        departure_date=date(2026, 10, 10),
+        return_date=date(2026, 10, 10),
+        travelers=2,
+        budget=200000,
+    )
+    plan = plan_trip(request)
+
+    assert plan.review is not None
+    assert plan.review.verdict == "FAIL", "an impossible trip must not pass"
+    assert any(i.check == "destination_coverage" for i in plan.review.issues)
+    assert any("replan guidance" in e for e in plan.errors)
+
+
+def test_a_failing_plan_still_terminates(sample_request: TravelRequest) -> None:
+    """Bounded retries: a plan that cannot pass must still return, not hang."""
+    request = TravelRequest(
+        origin="Mumbai",
+        destinations=["Tokyo", "Kyoto", "Osaka"],
+        departure_date=date(2026, 10, 10),
+        return_date=date(2026, 10, 10),
+        travelers=1,
+        budget=200000,
+    )
+    plan = plan_trip(request)
+
+    assert plan.review is not None
+    assert plan.daily_itinerary, "a failed review still returns the best attempt"
+
+
+def test_itinerary_only_schedules_real_inventory(
+    sample_request: TravelRequest,
+) -> None:
+    """Nothing may appear on a day that did not come from a search."""
+    plan = plan_trip(sample_request)
+
+    known = (
+        {a.activity for a in plan.activities}
+        | {r.name for r in plan.restaurants}
+        | {"Hotel check-in"}
+    )
+    for day in plan.daily_itinerary:
+        for item in day.items:
+            if item.kind in {"activity", "meal"}:
+                assert item.title in known, f"unknown item scheduled: {item.title}"
+
+
 def test_budget_router_stops_after_max_retries(
     sample_request: TravelRequest,
 ) -> None:

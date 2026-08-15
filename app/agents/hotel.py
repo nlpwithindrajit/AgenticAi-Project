@@ -316,10 +316,28 @@ class HotelAgent:
             city_center=centre,
         )
 
-    def run(self, request: TravelRequest) -> HotelResult:
-        """Search every destination, rank per destination, then explain."""
+    def run(
+        self, request: TravelRequest, *, cost_pressure: float = 1.0
+    ) -> HotelResult:
+        """Search every destination, rank per destination, then explain.
+
+        `cost_pressure` below 1.0 tightens the price cap so a budget replan
+        searches cheaper rather than repeating the same search.
+        """
         notes: list[str] = []
         plan = self.plan_search(request)
+        if cost_pressure < 1.0 and plan.max_total_price is not None:
+            plan = plan.model_copy(
+                update={
+                    "max_total_price": round(
+                        plan.max_total_price * cost_pressure, 2
+                    )
+                }
+            )
+            notes.append(
+                f"budget pressure: hotel cap tightened to "
+                f"{plan.max_total_price:,.0f} {request.currency}"
+            )
         if plan.reasoning:
             notes.append(f"hotel search plan: {plan.reasoning}")
 

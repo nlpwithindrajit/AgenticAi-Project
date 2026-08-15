@@ -14,12 +14,14 @@ this module should ever be mistaken for a real search result.
 from __future__ import annotations
 
 import logging
-from datetime import timedelta
 
 from app.agents.activity import ActivityAgent
+from app.agents.budget import BudgetAgent
 from app.agents.flight import FlightAgent
 from app.agents.hotel import HotelAgent, split_stay
+from app.agents.itinerary import ItineraryAgent
 from app.agents.restaurant import RestaurantAgent
+from app.agents.reviewer import ReviewAgent, guidance_from
 from app.config import get_settings
 from app.graph.state import (
     MAX_BUDGET_RETRIES,
@@ -28,18 +30,12 @@ from app.graph.state import (
 )
 from app.models.travel import (
     Activity,
-    BudgetBreakdown,
-    BudgetSummary,
-    DayPlan,
     DestinationInfo,
     FlightOption,
     FlightSegment,
     FlightSlice,
     HotelOption,
-    ItineraryItem,
     Restaurant,
-    ReviewIssue,
-    ReviewResult,
     TransportLeg,
     TripRequirements,
 )
@@ -64,10 +60,6 @@ _STUB_BUDGET_SHARE = {
     "restaurants": 0.12,
     "transportation": 0.08,
 }
-
-# How much cheaper the re-search comes back each time the budget loop fires.
-_CHEAPER_STEP = 0.25
-
 
 def _destinations_by_day(state: TravelState) -> list[str]:
     """Spread the requested destinations across the trip, one entry per day."""
@@ -133,12 +125,10 @@ def _stub_flight_offers(state: TravelState) -> list[FlightOption]:
     ranked offer" path it takes with real data.
     """
     request = state["request"]
-    discount = (
-        1.0 - _CHEAPER_STEP * state.get("budget_retries", 0)
-        if state.get("cheaper_target") == "flight"
-        else 1.0
-    )
-    best_price = request.budget * _STUB_BUDGET_SHARE["flights"] * max(discount, 0.3)
+    # Same signal the real agent uses, so the budget loop behaves the same way
+    # with and without credentials.
+    pressure = max(state.get("cost_pressure", 1.0), 0.3)
+    best_price = request.budget * _STUB_BUDGET_SHARE["flights"] * pressure
     destination = request.destinations[0]
 
     def _slice(
@@ -216,7 +206,9 @@ def flight_node(state: TravelState) -> TravelState:
 
     if settings.amadeus_enabled:
         try:
-            result = FlightAgent().run(request)
+            result = FlightAgent().run(
+                request, cost_pressure=state.get("cost_pressure", 1.0)
+            )
             errors.extend(result.notes)
             if result.recommendations:
                 return {
@@ -257,12 +249,8 @@ def _stub_hotel_offers(state: TravelState) -> list[HotelOption]:
     "pick the best per destination" path it takes with real data.
     """
     request = state["request"]
-    discount = (
-        1.0 - _CHEAPER_STEP * state.get("budget_retries", 0)
-        if state.get("cheaper_target") == "hotel"
-        else 1.0
-    )
-    total = request.budget * _STUB_BUDGET_SHARE["hotels"] * max(discount, 0.3)
+    pressure = max(state.get("cost_pressure", 1.0), 0.3)
+    total = request.budget * _STUB_BUDGET_SHARE["hotels"] * pressure
     best_per_destination = total / len(request.destinations)
 
     hotels: list[HotelOption] = []
@@ -314,7 +302,9 @@ def hotel_node(state: TravelState) -> TravelState:
 
     if settings.amadeus_enabled:
         try:
-            result = HotelAgent().run(request)
+            result = HotelAgent().run(
+                request, cost_pressure=state.get("cost_pressure", 1.0)
+            )
             errors.extend(result.notes)
             if result.recommendations:
                 return {
@@ -520,199 +510,80 @@ def transportation_node(state: TravelState) -> TravelState:
 
 
 def budget_node(state: TravelState) -> TravelState:
-    """Budget agent — totals every category and compares against the budget."""
+    """Budget agent — deterministic totals, LLM judgement on where to save.
+
+    Arithmetic is never delegated to a model. What the agent contributes is the
+    choice of which category should absorb a cut when the trip does not fit.
+    """
     request = state["request"]
+    errors = list(state.get("errors", []))
+    agent = BudgetAgent()
 
-    # Flight recommendations are ALTERNATIVES, not legs — cost only the top
-    # ranked offer, whose price already covers every traveller and both
-    # directions. Summing the list would bill the trip for options we rejected.
-    flights = state.get("flight_recommendations", [])
-    flight_cost = flights[0].price if flights else 0.0
-
-    # Same trap as flights: hotel recommendations are alternatives *per
-    # destination*. Cost the best-scoring stay in each city, once.
-    hotels = state.get("hotel_recommendations", [])
-    best_by_destination: dict[str, HotelOption] = {}
-    for hotel in hotels:
-        current = best_by_destination.get(hotel.destination)
-        if current is None or hotel.score > current.score:
-            best_by_destination[hotel.destination] = hotel
-    hotel_cost = sum(h.total_price for h in best_by_destination.values())
-
-    breakdown = BudgetBreakdown(
-        flights=flight_cost,
-        hotels=hotel_cost,
-        activities=sum(a.estimated_cost for a in state.get("activities", [])),
-        restaurants=sum(r.price_estimate for r in state.get("restaurants", [])),
-        transportation=sum(
-            t.estimated_cost for t in state.get("transportation_plan", [])
-        ),
-        currency=request.currency,
-    )
-    estimated_total = round(breakdown.estimated_total, 2)
-    over_budget = estimated_total > request.budget
-
-    summary = BudgetSummary(
-        breakdown=breakdown,
-        estimated_total=estimated_total,
-        budget=request.budget,
-        remaining=round(request.budget - estimated_total, 2),
-        over_budget=over_budget,
-        currency=request.currency,
+    summary = agent.compute(
+        request,
+        flights=state.get("flight_recommendations"),
+        hotels=state.get("hotel_recommendations"),
+        activities=state.get("activities"),
+        restaurants=state.get("restaurants"),
+        transport=state.get("transportation_plan"),
     )
 
     update: TravelState = {"budget": summary}
-    if over_budget:
-        # Send the loop at whichever category is actually the biggest spend.
-        update["cheaper_target"] = (
-            "flight" if breakdown.flights >= breakdown.hotels else "hotel"
+
+    if summary.over_budget:
+        plan = agent.choose_savings(request, summary)
+        update["cheaper_target"] = plan.target
+        # Tighten the cap for the retry, compounding across loop iterations.
+        update["cost_pressure"] = round(
+            state.get("cost_pressure", 1.0) * plan.reduction_ratio, 4
         )
+        errors.append(f"budget: {plan.reasoning}")
+        update["errors"] = errors
+    else:
+        explanation = agent.explain(request, summary)
+        if explanation:
+            errors.append(f"budget: {explanation}")
+            update["errors"] = errors
+
     return update
 
 
 def itinerary_node(state: TravelState) -> TravelState:
-    """Itinerary agent — turns the inventory into a day-by-day schedule."""
+    """Itinerary agent — sequences existing inventory, never invents any.
+
+    The agent may only schedule items from a catalogue built here from real
+    recommendations; anything else it returns is dropped and recorded.
+    """
     request = state["request"]
-    schedule = _destinations_by_day(state)
-    activities = {a.recommended_day: a for a in state.get("activities", [])}
-    restaurants = {r.recommended_day: r for r in state.get("restaurants", [])}
-    flights = state.get("flight_recommendations", [])
-    # The itinerary follows the ONE offer we recommend, not the alternatives.
-    chosen = flights[0] if flights else None
+    errors = list(state.get("errors", []))
 
-    days: list[DayPlan] = []
-    for index, destination in enumerate(schedule):
-        day_number = index + 1
-        day_date = request.departure_date + timedelta(days=index)
-        is_last_day = day_number == len(schedule)
-        has_return_flight = is_last_day and chosen is not None and chosen.inbound
-        items: list[ItineraryItem] = []
+    result = ItineraryAgent().build(
+        request,
+        _destinations_by_day(state),
+        flights=state.get("flight_recommendations"),
+        hotels=state.get("hotel_recommendations"),
+        activities=state.get("activities"),
+        restaurants=state.get("restaurants"),
+    )
+    errors.extend(result.notes)
 
-        if day_number == 1 and chosen is not None:
-            items.append(
-                ItineraryItem(
-                    time="09:00",
-                    title=(
-                        f"Flight {chosen.outbound.origin} to "
-                        f"{chosen.outbound.destination}"
-                    ),
-                    kind="flight",
-                )
-            )
-            items.append(
-                ItineraryItem(time="19:00", title="Hotel check-in", kind="hotel")
-            )
-
-        activity = activities.get(day_number)
-        if activity is not None:
-            items.append(
-                ItineraryItem(
-                    time="14:00",
-                    title=activity.activity,
-                    kind="activity",
-                    location=activity.location,
-                )
-            )
-
-        restaurant = restaurants.get(day_number)
-        if restaurant is not None:
-            # Eat earlier on departure day so dinner clears the return flight.
-            items.append(
-                ItineraryItem(
-                    time="17:00" if has_return_flight else "20:00",
-                    title=restaurant.name,
-                    kind="meal",
-                )
-            )
-
-        if has_return_flight and chosen is not None and chosen.inbound is not None:
-            items.append(
-                ItineraryItem(
-                    time="20:00",
-                    title=f"Return flight to {chosen.inbound.destination}",
-                    kind="flight",
-                )
-            )
-
-        days.append(
-            DayPlan(
-                day=day_number,
-                date=day_date,
-                destination=destination,
-                items=sorted(items, key=lambda item: item.time),
-            )
-        )
-
-    return {"daily_itinerary": days}
+    return {"daily_itinerary": result.days, "errors": errors}
 
 
 def review_node(state: TravelState) -> TravelState:
-    """Review agent — the quality gate. These checks are real, not stubbed."""
+    """Review agent — rule checks decide the verdict; the LLM adds a second pass."""
     request = state["request"]
-    issues: list[ReviewIssue] = []
 
-    itinerary = state.get("daily_itinerary", [])
-    if len(itinerary) != request.duration_days:
-        issues.append(
-            ReviewIssue(
-                check="itinerary_length",
-                detail=(
-                    f"itinerary covers {len(itinerary)} days, "
-                    f"request covers {request.duration_days}"
-                ),
-            )
-        )
-
-    if itinerary:
-        if itinerary[0].date != request.departure_date:
-            issues.append(
-                ReviewIssue(
-                    check="start_date",
-                    detail="first itinerary day does not match departure_date",
-                )
-            )
-        if itinerary[-1].date != request.return_date:
-            issues.append(
-                ReviewIssue(
-                    check="end_date",
-                    detail="last itinerary day does not match return_date",
-                )
-            )
-
-    if not state.get("flight_recommendations"):
-        issues.append(
-            ReviewIssue(check="flights", detail="no flight recommendations produced")
-        )
-    if not state.get("hotel_recommendations"):
-        issues.append(
-            ReviewIssue(check="hotels", detail="no hotel recommendations produced")
-        )
-
-    budget = state.get("budget")
-    if budget is not None and budget.over_budget:
-        issues.append(
-            ReviewIssue(
-                check="budget",
-                detail=(
-                    f"estimated {budget.estimated_total} {budget.currency} exceeds "
-                    f"budget {budget.budget} {budget.currency}"
-                ),
-            )
-        )
-
-    for day in itinerary:
-        times = [item.time for item in day.items]
-        if len(times) != len(set(times)):
-            issues.append(
-                ReviewIssue(
-                    check="schedule_conflict",
-                    detail=f"day {day.day} has two entries at the same time",
-                )
-            )
-
-    blocking = [issue for issue in issues if issue.severity == "error"]
-    verdict = "FAIL" if blocking else "PASS"
-    return {"review": ReviewResult(verdict=verdict, issues=issues)}
+    result = ReviewAgent().review(
+        request,
+        itinerary=state.get("daily_itinerary"),
+        flights=state.get("flight_recommendations"),
+        hotels=state.get("hotel_recommendations"),
+        activities=state.get("activities"),
+        restaurants=state.get("restaurants"),
+        budget=state.get("budget"),
+    )
+    return {"review": result}
 
 
 def budget_replan_node(state: TravelState) -> TravelState:
@@ -731,17 +602,35 @@ def budget_replan_node(state: TravelState) -> TravelState:
 
 
 def replan_node(state: TravelState) -> TravelState:
-    """Entered when the Review agent fails the plan; feeds back to the planner."""
+    """Entered when the Review agent fails the plan; feeds the planner guidance.
+
+    Without translating the failure into directives the next pass would repeat
+    the same search and fail identically until the retry budget ran out.
+    """
     review = state.get("review")
-    details = (
-        "; ".join(f"{i.check}: {i.detail}" for i in review.issues) if review else ""
-    )
+    issues = review.issues if review else []
+    details = "; ".join(f"{i.check}: {i.detail}" for i in issues)
+
     errors = list(state.get("errors", []))
     errors.append(f"replan triggered by review failure: {details}")
-    return {
+
+    guidance = list(state.get("replan_guidance", []))
+    fresh = [g for g in guidance_from(issues) if g not in guidance]
+    guidance.extend(fresh)
+    for item in fresh:
+        errors.append(f"replan guidance: {item}")
+
+    update: TravelState = {
         "review_retries": state.get("review_retries", 0) + 1,
+        "replan_guidance": guidance,
         "errors": errors,
     }
+
+    # A budget failure means the next search must actually look cheaper.
+    if any(i.check == "budget" and i.severity == "error" for i in issues):
+        update["cost_pressure"] = round(state.get("cost_pressure", 1.0) * 0.85, 4)
+
+    return update
 
 
 # ---------------------------------------------------------------------------

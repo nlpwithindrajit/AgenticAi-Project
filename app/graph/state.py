@@ -59,6 +59,12 @@ class TravelState(TypedDict, total=False):
     review_retries: int
     cheaper_target: CheaperTarget
 
+    # What the next pass should do differently. Without these a replan just
+    # re-runs the same search and fails the same way until retries run out.
+    cost_pressure: float
+    """Multiplier applied to search price caps on a retry; 1.0 = no pressure."""
+    replan_guidance: list[str]
+
     # --- diagnostics -----------------------------------------------------
     errors: list[str]
     trace_id: str
@@ -85,6 +91,8 @@ def initial_state(request: TravelRequest, trace_id: str | None = None) -> Travel
         "daily_itinerary": [],
         "budget_retries": 0,
         "review_retries": 0,
+        "cost_pressure": 1.0,
+        "replan_guidance": [],
         "errors": [],
     }
     if trace_id is not None:
