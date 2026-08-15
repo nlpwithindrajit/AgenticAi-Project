@@ -7,7 +7,7 @@ costed budget — with an explanation of why each option was chosen.
 Full design: [`projectIdea.md`](./projectIdea.md). Working agreements:
 [`CLAUDE.md`](./CLAUDE.md).
 
-## Status — Milestones 1-5 complete
+## Status — Milestones 1-6 complete
 
 What is **real**:
 
@@ -23,6 +23,8 @@ What is **real**:
   Interest, anchored on the hotel we recommended, scheduled one per day
 - **Budget, Itinerary and Review agents**, and a replanning loop that changes
   what the next pass actually searches for
+- **Langfuse tracing**: one trace per request, a span per agent, per Amadeus
+  call and per LLM call, with review and budget scores
 - `POST /plan-trip` and `GET /health` on FastAPI
 - Retry-bounded loops, so a bad edit fails loudly instead of hanging
 
@@ -36,7 +38,7 @@ falls back to stub inventory *and says so in `TripPlan.errors`*.
 
 ```bash
 make install                        # uv sync — creates .venv from uv.lock
-make test                           # 196 tests, no keys needed (HTTP is mocked)
+make test                           # 210 tests, no keys needed (HTTP is mocked)
 make dev                            # API with auto-reload on :8000
 ```
 
@@ -173,7 +175,7 @@ app/
 ├── agents/          # flight, hotel, activity, restaurant,
 │                 #   budget, itinerary, reviewer — reasoning agents
 ├── tools/           # amadeus.py (transport), flights, hotels, places
-├── services/        # langfuse.py — trace seam    (Milestone 6 fills it in)
+├── services/        # langfuse.py — tracing (no-op without keys)
 └── models/          # travel.py — Pydantic schemas
 tests/
 ```
@@ -340,6 +342,39 @@ Both loops stay bounded. A genuinely impossible trip — three cities in one day
 comes back `FAIL` with the reason and the guidance recorded, rather than
 looping forever or quietly passing.
 
+### Observability (Milestone 6)
+
+Set `LANGFUSE_PUBLIC_KEY` and `LANGFUSE_SECRET_KEY` and every request becomes
+one trace:
+
+```
+plan-trip                            (chain)
+├── planner                          (agent)
+├── flight-agent                     (agent)
+│   ├── amadeus/v1/reference-data/locations   (tool)
+│   ├── amadeus/v2/shopping/flight-offers     (tool)
+│   └── ChatAnthropic                         (generation)
+├── hotel-agent  … activity-agent  … restaurant-agent
+├── budget-agent
+├── flight-agent                     ← the budget loop, visible as a repeat
+├── itinerary-agent
+└── review-agent
+```
+
+Agent reasoning, provider calls and LLM calls are separate observation types,
+so you can tell what an agent *decided* from what the API actually *returned*.
+Loop iterations appear as repeated spans — a loop you cannot see is a loop you
+cannot debug. Two scores land on each trace: `review_passed` (1/0) and
+`budget_used` (estimated ÷ budget, so above 1.0 means the loop never converged).
+
+Two properties are enforced by tests rather than hoped for:
+
+- **Inert without keys.** Every helper is a no-op; the graph is byte-identical.
+- **Never fatal with them.** A tracer that throws is logged and swallowed. A
+  request completed normally with Langfuse pointed at a dead port — the only
+  cost is up to `LANGFUSE_TIMEOUT_SECONDS` of flush, which is why that is
+  bounded and configurable.
+
 ## Configuration
 
 Copy `.env.example` to `.env`. Nothing in it is required to run the graph —
@@ -356,8 +391,8 @@ fallbacks to real reasoning; every one of them works without it.
 | 3 | Hotel Agent — weighted ranking (price 30 / location 25 / rating 20 / amenities 15 / prefs 10) | done |
 | 4 | Activity + Restaurant Agents | done |
 | 5 | Budget / Itinerary / Review agents + replanning loop | done |
-| 6 | Langfuse instrumentation | next |
-| 7 | Next.js UI on Vercel | |
+| 6 | Langfuse instrumentation | done |
+| 7 | Next.js UI on Vercel | next |
 | 8 | Docker → ECR → AWS App Runner | |
 
 MVP scope stays narrow: one flight API, one hotel provider, one places API.
