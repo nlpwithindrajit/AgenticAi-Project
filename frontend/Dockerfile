@@ -1,9 +1,14 @@
-# The Next.js UI, for Amazon ECR -> AWS App Runner.
+# The Next.js UI, for Amazon ECR -> Amazon ECS (Fargate).
 #
 # NOTE: the API URL is baked in at BUILD time, not run time. `NEXT_PUBLIC_*`
 # variables are inlined into the client bundle during `next build`, so the
-# browser cannot read an App Runner environment variable set later. That makes
-# this image environment-specific: rebuild it if the API URL changes.
+# browser cannot read a task-definition environment variable set later.
+#
+# In production this is built as `/api` — a relative path. The load balancer
+# serves the UI at / and the API at /api/*, so one origin covers both and the
+# image stays valid whatever hostname the ALB (or a custom domain) ends up
+# with. Point it at an absolute URL only when the API is genuinely elsewhere,
+# and remember that then the API's ALLOWED_ORIGINS has to list this UI.
 
 FROM node:22-alpine AS deps
 WORKDIR /app

@@ -1,0 +1,59 @@
+{
+  "family": "travel-planner-api",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "1024",
+  "memory": "2048",
+  "runtimePlatform": {
+    "cpuArchitecture": "X86_64",
+    "operatingSystemFamily": "LINUX"
+  },
+  "executionRoleArn": "arn:aws:iam::__ACCOUNT__:role/travelPlannerEcsExecutionRole",
+  "containerDefinitions": [
+    {
+      "name": "api",
+      "image": "__IMAGE__",
+      "essential": true,
+      "portMappings": [{ "containerPort": 8000, "protocol": "tcp" }],
+      "environment": [
+        { "name": "ENVIRONMENT", "value": "production" },
+        { "name": "LLM_PROVIDER", "value": "openai" },
+        { "name": "OPENAI_MODEL", "value": "gpt-4o-mini" },
+        { "name": "LANGFUSE_HOST", "value": "https://us.cloud.langfuse.com" },
+        { "name": "ALLOWED_ORIGINS", "value": "[\"__BASE_URL__\"]" }
+      ],
+      "secrets": [
+        {
+          "name": "OPENAI_API_KEY",
+          "valueFrom": "arn:aws:ssm:__REGION__:__ACCOUNT__:parameter/travel-planner/OPENAI_API_KEY"
+        },
+        {
+          "name": "LANGFUSE_PUBLIC_KEY",
+          "valueFrom": "arn:aws:ssm:__REGION__:__ACCOUNT__:parameter/travel-planner/LANGFUSE_PUBLIC_KEY"
+        },
+        {
+          "name": "LANGFUSE_SECRET_KEY",
+          "valueFrom": "arn:aws:ssm:__REGION__:__ACCOUNT__:parameter/travel-planner/LANGFUSE_SECRET_KEY"
+        }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/travel-planner-api",
+          "awslogs-region": "__REGION__",
+          "awslogs-stream-prefix": "ecs"
+        }
+      },
+      "healthCheck": {
+        "command": [
+          "CMD-SHELL",
+          "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4).status == 200 else 1)\""
+        ],
+        "interval": 30,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 45
+      }
+    }
+  ]
+}

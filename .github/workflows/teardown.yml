@@ -1,0 +1,134 @@
+name: teardown
+
+# Stop paying for the deployment.
+#
+# Two modes, because they cost and cost-to-reverse very differently:
+#
+#   stop     desired-count 0 on both services. Fargate charges stop within a
+#            minute; the load balancer keeps billing (~$16/month) and the URL
+#            keeps working as a 503. Reverse it by running `deploy`.
+#
+#   destroy  also deletes the services, listener rules, target groups, load
+#            balancer and cluster. Everything stops billing except ECR storage
+#            (cents) and the SSM parameters (free). The DNS name is gone for
+#            good — a new ALB gets a new one. Reverse it by running `provision`
+#            then `deploy`.
+#
+# Neither mode touches ECR images, SSM secrets, or IAM, so nothing you would
+# have to recreate by hand is destroyed.
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: What to tear down
+        required: true
+        type: choice
+        default: stop
+        options: [stop, destroy]
+      confirm:
+        description: "Type DESTROY to confirm (only checked for mode=destroy)"
+        required: false
+        type: string
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  CLUSTER: travel-planner
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  teardown:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Check the confirmation
+        if: inputs.mode == 'destroy'
+        run: |
+          if [ "${{ inputs.confirm }}" != "DESTROY" ]; then
+            echo "::error::mode=destroy needs DESTROY typed in the confirm box."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Scale both services to zero
+        run: |
+          set -euo pipefail
+          for svc in travel-planner-api travel-planner-ui; do
+            if aws ecs describe-services --cluster "$CLUSTER" --services "$svc" \
+                 --query 'services[0].status' --output text 2>/dev/null | grep -q ACTIVE; then
+              aws ecs update-service --cluster "$CLUSTER" --service "$svc" \
+                --desired-count 0 >/dev/null
+              echo "$svc -> desired-count 0"
+            else
+              echo "$svc not present, skipping"
+            fi
+          done
+
+      - name: Destroy the load balancer and services
+        if: inputs.mode == 'destroy'
+        run: |
+          set -euo pipefail
+
+          # Services first: an ALB cannot be deleted while a target group is
+          # still attached to a running service, and the error does not say so.
+          for svc in travel-planner-api travel-planner-ui; do
+            aws ecs delete-service --cluster "$CLUSTER" --service "$svc" --force \
+              >/dev/null 2>&1 && echo "deleted service $svc" || echo "no service $svc"
+          done
+          aws ecs wait services-inactive --cluster "$CLUSTER" \
+            --services travel-planner-api travel-planner-ui 2>/dev/null || true
+
+          alb=$(aws elbv2 describe-load-balancers --names travel-planner-alb \
+            --query 'LoadBalancers[0].LoadBalancerArn' --output text 2>/dev/null || true)
+          if [ -n "$alb" ] && [ "$alb" != "None" ]; then
+            aws elbv2 delete-load-balancer --load-balancer-arn "$alb"
+            # Target group deletion fails until the listener is really gone.
+            echo "waiting for the load balancer to disappear"
+            aws elbv2 wait load-balancers-deleted --load-balancer-arns "$alb" || true
+            echo "deleted load balancer"
+          fi
+
+          for tg in travel-planner-api-tg travel-planner-ui-tg; do
+            arn=$(aws elbv2 describe-target-groups --names "$tg" \
+              --query 'TargetGroups[0].TargetGroupArn' --output text 2>/dev/null || true)
+            if [ -n "$arn" ] && [ "$arn" != "None" ]; then
+              aws elbv2 delete-target-group --target-group-arn "$arn" \
+                && echo "deleted target group $tg"
+            fi
+          done
+
+          aws ecs delete-cluster --cluster "$CLUSTER" >/dev/null 2>&1 \
+            && echo "deleted cluster" || echo "cluster not empty yet, delete by hand"
+
+      - name: Summary
+        run: |
+          {
+            echo "### Teardown: \`${{ inputs.mode }}\`"
+            echo
+            if [ "${{ inputs.mode }}" = "destroy" ]; then
+              echo "Load balancer, target groups, services and cluster are gone."
+              echo "ECR images, SSM secrets and IAM roles were kept."
+              echo
+              echo "To bring it back: run **provision**, then **deploy**."
+            else
+              echo "Both services are at desired-count 0 — no Fargate charges."
+              echo "The load balancer still exists and still bills (~\$16/month);"
+              echo "run this workflow with \`destroy\` to remove it too."
+              echo
+              echo "To bring it back: run **deploy**."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

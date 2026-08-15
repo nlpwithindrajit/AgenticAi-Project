@@ -1,0 +1,89 @@
+name: provision
+
+# One-time (and idempotent) AWS infrastructure for the travel planner:
+# ECR repositories, SSM parameters for the secrets, IAM, log groups, security
+# groups, an Application Load Balancer with two target groups, the ECS cluster
+# and the two Fargate services.
+#
+# Manual only. This is the workflow that CREATES BILLABLE RESOURCES — an ALB
+# and two always-on Fargate tasks — so it asks you to type the region name to
+# confirm rather than running off a push, a tag, or a merge.
+#
+# Safe to re-run: every resource is looked up before it is created, so a
+# half-finished run resumes instead of duplicating. Re-running is also how you
+# push rotated secrets into SSM.
+#
+# After this, ship code with the `deploy` workflow. Stop the bill with
+# `teardown`.
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type the region name to confirm (creates billable resources)'
+        required: true
+        type: string
+      region:
+        description: AWS region
+        required: true
+        default: us-east-1
+        type: string
+
+concurrency:
+  # Provisioning and deploying at once would race on the ECS services.
+  group: deploy-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  provision:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Check the confirmation
+        run: |
+          if [ "${{ inputs.confirm }}" != "${{ inputs.region }}" ]; then
+            echo "::error::Type '${{ inputs.region }}' in the confirm box to proceed."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ inputs.region }}
+
+      - name: Provision
+        env:
+          AWS_REGION: ${{ inputs.region }}
+          # Written into SSM Parameter Store as SecureString, never into a task
+          # definition. A missing one is reported, not fatal: the API starts and
+          # falls back to its deterministic behaviour, which is the documented
+          # no-key path the tests already cover.
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          LANGFUSE_PUBLIC_KEY: ${{ secrets.LANGFUSE_PUBLIC_KEY }}
+          LANGFUSE_SECRET_KEY: ${{ secrets.LANGFUSE_SECRET_KEY }}
+        run: ./deploy/provision-ecs.sh
+
+      - name: Summary
+        env:
+          AWS_REGION: ${{ inputs.region }}
+        run: |
+          dns=$(aws elbv2 describe-load-balancers --names travel-planner-alb \
+            --query 'LoadBalancers[0].DNSName' --output text)
+          {
+            echo "### Provisioned"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| UI  | http://${dns}/ |"
+            echo "| API | http://${dns}/api/health |"
+            echo
+            echo "Services are running the \`:latest\` images, which may be a"
+            echo "placeholder. Run the **deploy** workflow to ship real code."
+          } >> "$GITHUB_STEP_SUMMARY"

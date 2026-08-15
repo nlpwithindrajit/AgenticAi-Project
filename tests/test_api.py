@@ -14,6 +14,29 @@ def test_health() -> None:
     assert response.json()["status"] == "ok"
 
 
+def test_every_route_is_also_served_under_api() -> None:
+    """The /api mirror is load-bearing in production, so pin it here.
+
+    The deployed load balancer routes /api/* to this service and everything
+    else to the UI. If a route were ever added to `app` directly instead of to
+    `router`, it would work locally and 404 only once deployed — and for
+    /health that would fail the target group check and take the service down.
+
+    Asserted by calling, not by reading `app.routes`: recent FastAPI keeps
+    included routers as opaque `_IncludedRouter` entries rather than flattening
+    their paths onto the app, so introspection finds nothing and would pass or
+    fail for reasons unrelated to whether the route actually answers.
+    """
+    # 405/422 are fine — they prove the path is routed. 404 is the failure.
+    assert client.post("/api/plan-trip", json={}).status_code != 404
+    assert client.post("/api/chat", json={}).status_code != 404
+
+    # Health has to be identical: this is what the load balancer probes.
+    mirrored = client.get("/api/health")
+    assert mirrored.status_code == 200
+    assert mirrored.json() == client.get("/health").json()
+
+
 def test_plan_trip_returns_a_plan(sample_request: TravelRequest) -> None:
     response = client.post(
         "/plan-trip", json=sample_request.model_dump(mode="json")

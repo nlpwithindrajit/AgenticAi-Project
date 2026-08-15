@@ -1,4 +1,4 @@
-# The FastAPI backend, for Amazon ECR -> AWS App Runner.
+# The FastAPI backend, for Amazon ECR -> Amazon ECS (Fargate).
 #
 # Two stages so the runtime image carries no build tooling. Dependencies are
 # installed from uv.lock with --frozen, so a deploy can never quietly resolve a
@@ -25,7 +25,7 @@ RUN uv sync --frozen --no-dev
 
 FROM python:3.12-slim AS runtime
 
-# App Runner health checks and Amadeus both need TLS roots.
+# Health checks and Amadeus both need TLS roots.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/* \
@@ -45,10 +45,11 @@ ENV PATH="/app/.venv/bin:$PATH" \
 USER appuser
 EXPOSE 8000
 
-# App Runner probes this; failing it is how a bad deploy gets rolled back.
+# For `docker run` and compose. ECS uses the task definition's own health check
+# and the load balancer's target-group probe instead — this one is not read there.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
     CMD curl -fsS "http://127.0.0.1:${PORT}/health" || exit 1
 
-# Single worker: App Runner scales by adding instances, and the LangGraph
-# workflow holds no cross-request state that a second worker could share.
+# Single worker: ECS scales by adding tasks, and the LangGraph workflow holds
+# no cross-request state that a second worker could share.
 CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT}"]

@@ -31,6 +31,10 @@ dependencies = [
 dev = [
     "pytest>=8.3",
     "ruff>=0.7",
+    # tests/test_deploy_manifests.py parses the GitHub Actions workflows.
+    # It arrives transitively via langchain too, but a test that depends on
+    # someone else's transitive dependency breaks on an unrelated upgrade.
+    "pyyaml>=6.0",
 ]
 
 [tool.pytest.ini_options]

@@ -438,31 +438,114 @@ limits are pinned by tests rather than glossed over.
 
 ### Deployment (Milestone 8)
 
-Both services are containerised for **Amazon ECR → AWS App Runner** (the UI
-runs on AWS too, rather than Vercel).
+Both services are containerised for **Amazon ECR → Amazon ECS (Fargate)**,
+behind one Application Load Balancer. The UI runs on AWS too, rather than
+Vercel.
+
+```
+              ALB (:80)
+              /        \
+        /  ->  UI      /api/*  ->  API
+       (Fargate :3000)          (Fargate :8000)
+```
+
+**One load balancer, two target groups, one origin.** The UI is served at `/`
+and the API at `/api/*`. That halves the ALB bill, but the real reason is CORS:
+the browser makes no cross-origin request at all, so the failure below cannot
+happen in production. The API still answers on both `/` and `/api/*`, so local
+development, `docker compose` and the tests are unchanged.
 
 ```bash
-make images            # build both images without running them
-make up                # run the whole stack locally in those same images
-./deploy/deploy-aws.sh # build for linux/amd64, push both to ECR
+make images                # build both images without running them
+make up                    # run the whole stack locally in those same images
+./deploy/provision-ecs.sh  # ONE TIME: cluster, ALB, IAM, secrets, services
+./deploy/deploy-ecs.sh     # every release: build, push, roll, verify
 ```
+
+Or from CI: the **deploy** workflow (Actions → deploy → Run workflow, or push a
+`v*` tag) does the same thing and runs the full test suite first.
 
 Verified locally: API image 269 MB, UI image 230 MB, both reporting healthy,
 serving a complete plan across the container boundary.
 
-Three things that bite, all handled or flagged by the deploy script:
+Three things that bite, all handled by the scripts and the workflow:
 
 1. **CORS is not a soft failure.** If `ALLOWED_ORIGINS` does not contain the
    UI's real URL, the browser blocks every request — the UI looks broken while
    the API reports healthy, and there is no server-side error to find. The API
    logs a warning at startup if this is still the localhost default outside
-   `local`.
+   `local`. The single-origin layout above is what actually removes the risk;
+   `ALLOWED_ORIGINS` is still set correctly as a second line of defence.
 2. **The API URL is compiled into the UI.** `NEXT_PUBLIC_*` is inlined at build
-   time, so an App Runner environment variable set afterwards does nothing —
-   changing the API URL means rebuilding and repushing the UI image.
-3. **App Runner does not run arm64.** Building on an Apple Silicon Mac without
-   `--platform linux/amd64` yields a service that never goes healthy, with
-   nothing useful in the logs. The script forces the platform.
+   time, so a task-definition environment variable set afterwards does nothing.
+   Production builds it as the relative `/api`, which stays correct no matter
+   what hostname the ALB has — so the DNS name is not a build input, and the UI
+   image does not need rebuilding when it changes.
+3. **Fargate does not run the arm64 image you built on a Mac.** Without
+   `--platform linux/amd64` the task dies with `exec format error` buried in
+   CloudWatch. Both the script and the workflow force the platform.
+
+**Secrets are not in the task definitions.** `OPENAI_API_KEY` and the Langfuse
+keys live in SSM Parameter Store as `SecureString` and are injected at task
+start. Task definitions are readable by anyone with `ecs:DescribeTaskDefinition`
+and every revision is retained permanently, so a key pasted into one is
+effectively published.
+
+#### CI/CD — everything runs through GitHub Actions
+
+Four workflows in `.github/workflows/`. Nothing about the deployment needs a
+laptop; the shell scripts exist so you *can* run the same steps locally, but the
+pipeline is the workflows.
+
+| workflow | trigger | what it does |
+|---|---|---|
+| **test** | every push and PR, automatically | ruff, 235 backend tests, frontend typecheck + build, and both Docker images built (not pushed) |
+| **provision** | manual, type the region to confirm | creates the infrastructure: ECR, SSM secrets, IAM, log groups, security groups, ALB + target groups, cluster, both services |
+| **deploy** | manual, or push a `v*` tag | runs **test** first, then builds and pushes both images, registers new task definitions, rolls the services, waits for stability, verifies `/api/health` |
+| **teardown** | manual — `stop` or `destroy` | `stop` scales to zero (Fargate charges end, ALB keeps billing); `destroy` also removes the ALB, target groups, services and cluster |
+
+Typical life cycle:
+
+```
+provision   (once)
+deploy      (every release)
+teardown    (when you are done for the week)
+deploy      (to bring it back — it sets desired-count 1 again)
+```
+
+Three deliberate choices:
+
+- **`deploy` calls `test` as a reusable workflow**, so there is no path to
+  production that skips the suite. A red test is a failed deploy.
+- **Nothing deploys on a push to `main`.** Fargate bills continuously and a bad
+  deploy is slow to reverse, so shipping stays an explicit action — the Actions
+  tab or a `v*` tag.
+- **`provision` and `teardown` are manual with typed confirmation**, because
+  they create and delete billable resources. All three share one `concurrency`
+  group so they can never run against each other.
+
+`test` needs no secrets at all — the suite is hermetic (`tests/conftest.py`
+clears provider keys and disables the `.env` file), so a fork's pull request
+runs the full suite without any access to your account.
+
+Repository secrets the other three need: `AWS_ACCESS_KEY_ID`,
+`AWS_SECRET_ACCESS_KEY`, and — for `provision` only — `OPENAI_API_KEY`,
+`LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`, which it writes into SSM.
+
+#### AWS credentials for CI
+
+The workflow reads `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` from repository
+secrets. **Prefer GitHub OIDC**: it replaces a permanent key living in GitHub
+with a short-lived role assumption. Once the role exists, swap the two `with:`
+lines in `.github/workflows/deploy.yml` for:
+
+```yaml
+role-to-assume: arn:aws:iam::<account>:role/GitHubActionsDeploy
+aws-region: us-east-1
+```
+
+The `id-token: write` permission the workflow already declares is what makes
+that work.
 
 ## Configuration
 
@@ -482,7 +565,8 @@ fallbacks to real reasoning; every one of them works without it.
 | 5 | Budget / Itinerary / Review agents + replanning loop | done |
 | 6 | Langfuse instrumentation | done |
 | 7 | Next.js UI (on AWS, not Vercel) | done |
-| 8 | Docker → ECR → AWS App Runner | images done, deploy needs your AWS account |
+| 8 | Docker → ECR → Amazon ECS (Fargate) behind an ALB | images + CI + scripts done, provisioning needs your AWS account |
+| — | GitHub Actions: `test` on every push, `deploy` on demand or a `v*` tag | done |
 
 MVP scope stays narrow: one flight API, one hotel provider, one places API.
 Search → filter → rank → recommend. No booking, no auth, no payments.
