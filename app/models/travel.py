@@ -143,19 +143,48 @@ class FlightOption(BaseModel):
 
 
 class HotelOption(BaseModel):
+    """One priced hotel stay for one destination.
+
+    Like flights, these are *alternatives* — the Budget agent costs the best
+    one per destination, not the whole list.
+    """
+
+    hotel_id: str | None = None
+    offer_id: str | None = None
     name: str
     destination: str
+    chain_code: str | None = None
+
     check_in: date
     check_out: date
-    stars: float | None = None
-    rating: float | None = None
+    nights: int = 1
+
     price_per_night: float
     total_price: float
     currency: str = "INR"
-    location: str | None = None
+
+    latitude: float | None = None
+    longitude: float | None = None
+    distance_km: float | None = None
+    """Straight-line distance from the city centre reference point."""
+
+    stars: float | None = None
+    """Requested star band, when the provider honoured the filter. Amadeus does
+    not return a per-hotel star rating, so this is never invented."""
+
+    rating: float | None = None
+    """Guest sentiment 0-100 from Amadeus. None means unrated, not bad."""
+
+    room_type: str | None = None
+    room_description: str | None = None
     amenities: list[str] = Field(default_factory=list)
+
     score: float = 0.0
+    score_components: dict[str, float] = Field(default_factory=dict)
+    """Per-factor 0-1 scores that produced `score`. Only factors with real data
+    appear here — the weighting renormalises over what is present."""
     rationale: str | None = None
+    source: Literal["amadeus", "stub"] = "amadeus"
 
 
 class Activity(BaseModel):

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from datetime import date
 
+import pytest
+
 from app.graph import nodes
 from app.graph.graph import build_graph, plan_trip
 from app.graph.state import MAX_BUDGET_RETRIES, initial_state
@@ -79,6 +81,69 @@ def test_stub_flights_are_labelled_and_explained(
 
     assert all(f.source == "stub" for f in plan.flight_recommendations)
     assert any("Amadeus not configured" in error for error in plan.errors)
+
+
+def test_budget_costs_one_hotel_per_destination(
+    sample_request: TravelRequest,
+) -> None:
+    """Hotels are alternatives per city — bill the best in each, once."""
+    plan = plan_trip(sample_request)
+
+    assert plan.budget is not None
+    by_destination: dict[str, list] = {}
+    for hotel in plan.hotel_recommendations:
+        by_destination.setdefault(hotel.destination, []).append(hotel)
+
+    assert set(by_destination) == set(sample_request.destinations)
+    assert all(len(v) > 1 for v in by_destination.values()), "need alternatives"
+
+    expected = sum(
+        max(v, key=lambda h: h.score).total_price for v in by_destination.values()
+    )
+    assert plan.budget.breakdown.hotels == pytest.approx(expected)
+    assert plan.budget.breakdown.hotels < sum(
+        h.total_price for h in plan.hotel_recommendations
+    )
+
+
+def test_hotel_stays_cover_the_trip_without_gaps(
+    sample_request: TravelRequest,
+) -> None:
+    plan = plan_trip(sample_request)
+
+    best = {}
+    for hotel in plan.hotel_recommendations:
+        current = best.get(hotel.destination)
+        if current is None or hotel.score > current.score:
+            best[hotel.destination] = hotel
+
+    stays = sorted(best.values(), key=lambda h: h.check_in)
+    assert stays[0].check_in == sample_request.departure_date
+    assert stays[-1].check_out == sample_request.return_date
+    for earlier, later in zip(stays, stays[1:], strict=False):
+        assert earlier.check_out == later.check_in
+
+
+def test_stub_hotels_are_labelled(sample_request: TravelRequest) -> None:
+    plan = plan_trip(sample_request)
+
+    assert all(h.source == "stub" for h in plan.hotel_recommendations)
+    assert any("Amadeus not configured" in e for e in plan.errors)
+
+
+def test_every_hotel_score_component_is_exercised(
+    sample_request: TravelRequest,
+) -> None:
+    """A component stuck at zero usually means data was never populated."""
+    plan = plan_trip(sample_request)
+
+    for hotel in plan.hotel_recommendations:
+        assert {"price", "location", "rating", "amenities"} <= set(
+            hotel.score_components
+        )
+    assert any(
+        h.score_components["amenities"] > 0 for h in plan.hotel_recommendations
+    ), "amenity detection never fired — is the description being parsed?"
 
 
 def test_stub_flight_offers_vary_in_stops(sample_request: TravelRequest) -> None:

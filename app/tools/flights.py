@@ -1,39 +1,23 @@
-"""Amadeus Self-Service flight search — deterministic, no LLM calls.
+"""Amadeus flight search: normalisation, filtering and explainable ranking.
 
-This module owns everything mechanical about flights: OAuth2, the HTTP calls,
-IATA resolution, normalising Amadeus JSON into `FlightOption`, and the
-filter/rank scoring. The Flight *agent* (`app/agents/flight.py`) decides how to
-drive these functions; nothing here decides anything on its own.
-
-Endpoints used (Amadeus Self-Service):
-  POST /v1/security/oauth2/token          — client_credentials, form-encoded
-  GET  /v1/reference-data/locations       — city/airport -> IATA code
-  GET  /v2/shopping/flight-offers         — the search itself
-
-Search only. There is no booking path here, by design.
+Transport and auth live in `app/tools/amadeus.py`; this module turns raw
+Amadeus flight-offers JSON into `FlightOption` objects and scores them. No LLM
+calls belong here — the Flight agent makes the judgement calls.
 """
 
 from __future__ import annotations
 
 import logging
 import re
-import time
-from datetime import date
 from typing import Any
 
-import httpx
-
-from app.config import get_settings
 from app.models.travel import FlightOption, FlightSegment, FlightSlice
+from app.tools.amadeus import AmadeusClient, AmadeusError, FlightSearchError
 
 logger = logging.getLogger(__name__)
 
 # ISO-8601 durations as Amadeus emits them: "PT14H15M", "PT7H", "PT45M".
 _DURATION_RE = re.compile(r"^P(?:(?P<days>\d+)D)?T?(?:(?P<h>\d+)H)?(?:(?P<m>\d+)M)?$")
-
-
-class FlightSearchError(RuntimeError):
-    """Raised when the flight provider cannot answer. Never leaks credentials."""
 
 
 # ---------------------------------------------------------------------------
@@ -288,173 +272,13 @@ def rank_flights(
     return scored[:top_n]
 
 
-# ---------------------------------------------------------------------------
-# Amadeus HTTP client
-# ---------------------------------------------------------------------------
-
-
-class AmadeusClient:
-    """Thin, deterministic wrapper over the Amadeus Self-Service APIs."""
-
-    def __init__(
-        self,
-        client_id: str | None = None,
-        client_secret: str | None = None,
-        base_url: str | None = None,
-        timeout: float | None = None,
-        http_client: httpx.Client | None = None,
-    ) -> None:
-        settings = get_settings()
-        self.client_id = client_id or settings.amadeus_client_id
-        self.client_secret = client_secret or settings.amadeus_client_secret
-        self.base_url = (base_url or settings.amadeus_base_url).rstrip("/")
-        self.timeout = timeout or settings.amadeus_timeout_seconds
-        self._http = http_client
-        self._token: str | None = None
-        self._token_expires_at: float = 0.0
-        self._location_cache: dict[str, str] = {}
-
-    # -- plumbing --------------------------------------------------------
-
-    @property
-    def configured(self) -> bool:
-        return bool(self.client_id and self.client_secret)
-
-    def _client(self) -> httpx.Client:
-        if self._http is None:
-            self._http = httpx.Client(timeout=self.timeout)
-        return self._http
-
-    def close(self) -> None:
-        if self._http is not None:
-            self._http.close()
-            self._http = None
-
-    def __enter__(self) -> AmadeusClient:
-        return self
-
-    def __exit__(self, *exc_info: object) -> None:
-        self.close()
-
-    def _access_token(self) -> str:
-        """Fetch and cache an OAuth2 token, refreshing 60s before expiry."""
-        if not self.configured:
-            raise FlightSearchError("Amadeus credentials are not configured")
-
-        if self._token and time.monotonic() < self._token_expires_at:
-            return self._token
-
-        try:
-            response = self._client().post(
-                f"{self.base_url}/v1/security/oauth2/token",
-                data={
-                    "grant_type": "client_credentials",
-                    "client_id": self.client_id,
-                    "client_secret": self.client_secret,
-                },
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
-            )
-        except httpx.RequestError as exc:
-            raise FlightSearchError(f"could not reach Amadeus: {exc}") from exc
-
-        if response.status_code != 200:
-            # Deliberately does not echo the body — it can contain the secret.
-            raise FlightSearchError(
-                f"Amadeus authentication failed (HTTP {response.status_code})"
-            )
-
-        payload = response.json()
-        token = payload.get("access_token")
-        if not token:
-            raise FlightSearchError("Amadeus returned no access token")
-
-        self._token = token
-        self._token_expires_at = time.monotonic() + max(
-            int(payload.get("expires_in", 1799)) - 60, 30
-        )
-        return token
-
-    def _get(self, path: str, params: dict[str, Any]) -> dict[str, Any]:
-        token = self._access_token()
-        try:
-            response = self._client().get(
-                f"{self.base_url}{path}",
-                params=params,
-                headers={"Authorization": f"Bearer {token}"},
-            )
-        except httpx.RequestError as exc:
-            raise FlightSearchError(f"could not reach Amadeus: {exc}") from exc
-
-        if response.status_code == 401:
-            # Token rejected mid-flight; drop it so the next call re-authenticates.
-            self._token = None
-            raise FlightSearchError("Amadeus rejected the access token")
-        if response.status_code >= 400:
-            raise FlightSearchError(
-                f"Amadeus {path} failed (HTTP {response.status_code}): "
-                f"{_error_detail(response)}"
-            )
-        return response.json()
-
-    # -- API surface -----------------------------------------------------
-
-    def resolve_location_code(self, place: str) -> str:
-        """"Mumbai" -> "BOM". Already-valid IATA codes pass straight through."""
-        cleaned = place.strip()
-        if len(cleaned) == 3 and cleaned.isalpha():
-            return cleaned.upper()
-
-        key = cleaned.lower()
-        if key in self._location_cache:
-            return self._location_cache[key]
-
-        payload = self._get(
-            "/v1/reference-data/locations",
-            {"subType": "CITY,AIRPORT", "keyword": cleaned, "page[limit]": 5},
-        )
-        for entry in payload.get("data", []):
-            code = entry.get("iataCode")
-            if code:
-                self._location_cache[key] = code
-                return code
-
-        raise FlightSearchError(f"no IATA code found for {place!r}")
-
-    def search_flights(
-        self,
-        origin: str,
-        destination: str,
-        departure_date: date,
-        return_date: date | None = None,
-        adults: int = 1,
-        currency: str = "INR",
-        non_stop: bool = False,
-        max_results: int = 20,
-    ) -> dict[str, Any]:
-        """Raw Amadeus flight-offers payload. Callers normalise it."""
-        params: dict[str, Any] = {
-            "originLocationCode": self.resolve_location_code(origin),
-            "destinationLocationCode": self.resolve_location_code(destination),
-            "departureDate": departure_date.isoformat(),
-            "adults": adults,
-            "currencyCode": currency,
-            "max": max_results,
-        }
-        if return_date is not None:
-            params["returnDate"] = return_date.isoformat()
-        if non_stop:
-            params["nonStop"] = "true"
-
-        return self._get("/v2/shopping/flight-offers", params)
-
-
-def _error_detail(response: httpx.Response) -> str:
-    """Pull Amadeus's error text out without dumping the whole body."""
-    try:
-        errors = response.json().get("errors") or []
-    except ValueError:
-        return "unreadable error response"
-    if not errors:
-        return "no error detail"
-    first = errors[0]
-    return str(first.get("detail") or first.get("title") or first)
+__all__ = [
+    "AmadeusClient",
+    "AmadeusError",
+    "FlightSearchError",
+    "RANK_WEIGHTS",
+    "filter_flights",
+    "normalize_offers",
+    "parse_iso_duration",
+    "rank_flights",
+]

@@ -7,7 +7,7 @@ costed budget — with an explanation of why each option was chosen.
 Full design: [`projectIdea.md`](./projectIdea.md). Working agreements:
 [`CLAUDE.md`](./CLAUDE.md).
 
-## Status — Milestones 1 & 2 complete
+## Status — Milestones 1-3 complete
 
 What is **real**:
 
@@ -17,14 +17,17 @@ What is **real**:
 - **Flights, end to end**: Amadeus Self-Service search, IATA resolution,
   explainable filtering and ranking, and an LLM that plans the search and
   writes the recommendation rationale
+- **Hotels, end to end**: Amadeus hotel list + pricing + guest ratings, a
+  per-destination stay split, distance-from-centre scoring, and the same
+  LLM-plans / tool-executes split
 - `POST /plan-trip` and `GET /health` on FastAPI
 - Retry-bounded loops, so a bad edit fails loudly instead of hanging
 
-What is **stubbed**: hotels, activities, restaurants and transport. They invent
+What is **stubbed**: activities, restaurants and transport. They invent
 deterministic inventory labelled `STUB` so the graph runs end to end with **no
 API keys at all**. Nothing user-visible from a stub can be mistaken for a real
 search result — and when Amadeus is unconfigured or errors, the flight node
-falls back to stub inventory *and says so in `TripPlan.errors`*. Milestones 3–5
+falls back to stub inventory *and says so in `TripPlan.errors`*. Milestones 4-5
 replace each remaining stub with a reasoning agent (`app/agents/`) driving a
 deterministic tool client (`app/tools/`); the state contract does not change.
 
@@ -34,12 +37,13 @@ deterministic tool client (`app/tools/`); the state contract does not change.
 uv venv --python 3.11
 uv pip install -r requirements-dev.txt
 
-.venv/bin/python -m pytest          # 56 tests, no keys needed (HTTP is mocked)
+.venv/bin/python -m pytest          # 101 tests, no keys needed (HTTP is mocked)
 .venv/bin/python -m ruff check .
 .venv/bin/python -m uvicorn app.main:app --reload
 ```
 
-To search **real flights**, add free Amadeus Self-Service credentials to `.env`:
+To search **real flights and hotels**, add free Amadeus Self-Service
+credentials to `.env`:
 
 ```bash
 cp .env.example .env
@@ -100,8 +104,8 @@ app/
 ├── main.py          # FastAPI entry: /health, /plan-trip
 ├── config.py        # env settings; every integration optional
 ├── graph/           # state.py, nodes.py, graph.py — LangGraph wiring
-├── agents/          # reasoning agents            (Milestone 2+)
-├── tools/           # deterministic API clients   (Milestone 2+)
+├── agents/          # flight.py, hotel.py — reasoning agents
+├── tools/           # amadeus.py (transport), flights.py, hotels.py
 ├── services/        # langfuse.py — trace seam    (Milestone 6 fills it in)
 └── models/          # travel.py — Pydantic schemas
 tests/
@@ -141,9 +145,52 @@ Known MVP limits, all surfaced in `TripPlan.errors` rather than hidden:
 multi-city routing is priced as a round trip to the first destination, and the
 Amadeus test tier returns limited inventory.
 
+### Hotels (Milestone 3)
+
+Amadeus splits hotels across three endpoints, and **what each returns decides
+what can honestly be scored**:
+
+| Endpoint | Gives us | Does *not* give us |
+|---|---|---|
+| `hotels/by-city` | id, name, chain, coordinates | star rating, amenity list |
+| `hotel-offers` (v3) | prices, room type, free-text room description | structured amenities |
+| `hotel-sentiments` | guest rating 0-100 | coverage for every hotel |
+
+Consequences, each handled explicitly rather than papered over:
+
+- **Star ratings are never invented.** `ratings` is a *filter* on `by-city`, not
+  a returned field, so `stars` is set only when that filter was honoured. If it
+  returns nothing, the agent re-searches unfiltered and clears `stars`.
+- **Guest ratings are often missing.** A missing rating stays `None`; it never
+  becomes zero, and unrated hotels survive a `min_rating` floor.
+- **Amenities are read from room-description text**, so absence means "not
+  mentioned", not "not available".
+
+`rank_hotels` therefore scores each factor **only when data exists** and
+renormalises the weights over what is present — an unrated hotel is not
+punished for Amadeus lacking sentiment data on it. Each option carries its
+per-factor breakdown in `score_components`.
+
+| Factor | Weight | Source |
+|---|---|---|
+| Price | 30% | offer total for the stay |
+| Location | 25% | distance from the mean hotel position |
+| Rating | 20% | guest sentiment, when available |
+| Amenities | 15% | keywords in the room description |
+| Traveller preferences | 10% | chain match, confirmed star band |
+
+Amenities the traveller effectively asked for (via `interests`) count double
+the baseline ones. Distance is comparative *within a city* — Amadeus exposes no
+city-centre coordinate, so the mean hotel position stands in for it.
+
+A multi-destination trip is split into contiguous stays (5 nights over Tokyo +
+Kyoto becomes 3 + 2, with no gap between check-out and the next check-in), and
+each destination is searched, ranked and costed separately.
+
 ## Configuration
 
-Copy `.env.example` to `.env`. Nothing in it is required at Milestone 1.
+Copy `.env.example` to `.env`. Nothing in it is required to run the graph —
+Amadeus credentials switch flights and hotels from stub to real.
 
 ## Roadmap
 
@@ -151,8 +198,8 @@ Copy `.env.example` to `.env`. Nothing in it is required at Milestone 1.
 |---|-----------|-------|
 | 1 | Foundation — FastAPI, graph skeleton, both loops | done |
 | 2 | Flight Agent — Amadeus search, filter, rank | done |
-| 3 | Hotel Agent — weighted ranking (price 30 / location 25 / rating 20 / amenities 15 / prefs 10) | next |
-| 4 | Activity + Restaurant Agents | |
+| 3 | Hotel Agent — weighted ranking (price 30 / location 25 / rating 20 / amenities 15 / prefs 10) | done |
+| 4 | Activity + Restaurant Agents | next |
 | 5 | Budget / Itinerary / Review agents on real data | |
 | 6 | Langfuse instrumentation | |
 | 7 | Next.js UI on Vercel | |

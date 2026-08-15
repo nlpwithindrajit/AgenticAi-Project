@@ -8,9 +8,8 @@ import httpx
 import pytest
 
 from app.models.travel import FlightOption, FlightSegment, FlightSlice
+from app.tools.amadeus import AmadeusClient, AmadeusError, FlightSearchError
 from app.tools.flights import (
-    AmadeusClient,
-    FlightSearchError,
     filter_flights,
     normalize_offers,
     parse_iso_duration,
@@ -406,7 +405,8 @@ def test_unresolvable_place_raises() -> None:
             return httpx.Response(200, json={"access_token": "tok", "expires_in": 1799})
         return httpx.Response(200, json={"data": []})
 
-    with pytest.raises(FlightSearchError, match="no IATA code"):
+    # Location lookup is shared reference data, not flight-specific.
+    with pytest.raises(AmadeusError, match="no IATA code"):
         _amadeus(handler).resolve_location_code("Atlantis")
 
 

@@ -17,6 +17,7 @@ import logging
 from datetime import timedelta
 
 from app.agents.flight import FlightAgent
+from app.agents.hotel import HotelAgent, split_stay
 from app.config import get_settings
 from app.graph.state import (
     MAX_BUDGET_RETRIES,
@@ -40,7 +41,9 @@ from app.models.travel import (
     TransportLeg,
     TripRequirements,
 )
-from app.tools.flights import FlightSearchError, rank_flights
+from app.tools.amadeus import FlightSearchError, HotelSearchError
+from app.tools.flights import rank_flights
+from app.tools.hotels import detect_amenities, rank_hotels
 
 logger = logging.getLogger(__name__)
 
@@ -237,11 +240,14 @@ def flight_node(state: TravelState) -> TravelState:
     }
 
 
-def hotel_node(state: TravelState) -> TravelState:
-    """Hotel agent — search -> filter -> rank -> recommend.
+_STUB_ROOM_DESCRIPTION = "STUB ROOM\nFREE WIFI\nBREAKFAST INCLUDED"
 
-    Ranking weights (Milestone 3): price 30%, location 25%, rating 20%,
-    amenities 15%, traveler preferences 10%.
+
+def _stub_hotel_offers(state: TravelState) -> list[HotelOption]:
+    """Placeholder inventory, used only when Amadeus is not configured.
+
+    Returns three alternatives per destination so the graph exercises the same
+    "pick the best per destination" path it takes with real data.
     """
     request = state["request"]
     discount = (
@@ -250,39 +256,90 @@ def hotel_node(state: TravelState) -> TravelState:
         else 1.0
     )
     total = request.budget * _STUB_BUDGET_SHARE["hotels"] * max(discount, 0.3)
-
-    nights = max(request.nights, 1)
-    per_destination_total = total / len(request.destinations)
-    nights_per_destination = max(1, nights // len(request.destinations))
-
-    per_night = round(per_destination_total / nights_per_destination, 2)
+    best_per_destination = total / len(request.destinations)
 
     hotels: list[HotelOption] = []
-    check_in = request.departure_date
+    for destination, check_in, check_out in split_stay(
+        request.destinations, request.departure_date, request.return_date
+    ):
+        nights = max((check_out - check_in).days, 1)
+        for index in range(3):
+            price = round(best_per_destination * (1 + 0.15 * index), 2)
+            hotels.append(
+                HotelOption(
+                    hotel_id=f"STUB{destination[:3].upper()}{index}",
+                    name=f"STUB Hotel {destination} #{index + 1}",
+                    destination=destination,
+                    check_in=check_in,
+                    check_out=check_out,
+                    nights=nights,
+                    price_per_night=round(price / nights, 2),
+                    total_price=price,
+                    currency=request.currency,
+                    distance_km=1.0 + index * 2.5,
+                    stars=float(request.hotel_stars) if request.hotel_stars else None,
+                    rating=88.0 - index * 9,
+                    room_type="STANDARD_ROOM",
+                    room_description=_STUB_ROOM_DESCRIPTION,
+                    # Derived the same way the real path derives them, so the
+                    # amenities score is exercised rather than silently zero.
+                    amenities=detect_amenities(_STUB_ROOM_DESCRIPTION),
+                    source="stub",
+                )
+            )
+
+    return hotels
+
+
+def hotel_node(state: TravelState) -> TravelState:
+    """Hotel agent — search -> filter -> rank -> recommend (never book).
+
+    Ranking weights: price 30%, location 25%, rating 20%, amenities 15%,
+    traveller preferences 10% — renormalised per hotel over the factors
+    Amadeus actually returned data for.
+
+    Uses Amadeus when configured; otherwise falls back to clearly-labelled
+    STUB inventory and records why in `state["errors"]`.
+    """
+    request = state["request"]
+    errors = list(state.get("errors", []))
+    settings = get_settings()
+
+    if settings.amadeus_enabled:
+        try:
+            result = HotelAgent().run(request)
+            errors.extend(result.notes)
+            if result.recommendations:
+                return {
+                    "hotel_results": [h.model_dump() for h in result.recommendations],
+                    "hotel_recommendations": result.recommendations,
+                    "errors": errors,
+                }
+            errors.append("hotel search returned no offers; using STUB inventory")
+        except HotelSearchError as exc:
+            errors.append(f"hotel search failed ({exc}); using STUB inventory")
+        except Exception as exc:  # pragma: no cover - unexpected provider fault
+            logger.exception("unexpected hotel search failure")
+            errors.append(f"hotel search error ({exc}); using STUB inventory")
+    else:
+        errors.append("Amadeus not configured; using STUB hotel inventory")
+
+    stubs = _stub_hotel_offers(state)
+    ranked: list[HotelOption] = []
     for destination in request.destinations:
-        check_out = check_in + timedelta(days=nights_per_destination)
-        hotels.append(
-            HotelOption(
-                name=f"STUB Hotel {destination}",
-                destination=destination,
-                check_in=check_in,
-                check_out=check_out,
-                stars=float(request.hotel_stars or 4),
-                rating=8.5,
-                price_per_night=per_night,
-                total_price=round(per_destination_total, 2),
-                currency=request.currency,
-                location="STUB city centre",
-                amenities=["wifi", "breakfast"],
-                score=88.0,
-                rationale="STUB ranking: placeholder until the hotel API is wired up",
+        ranked.extend(
+            rank_hotels(
+                [h for h in stubs if h.destination == destination],
+                interests=request.interests,
+                requested_stars=request.hotel_stars,
+                top_n=3,
             )
         )
-        check_in = check_out
 
     return {
-        "hotel_results": [hotel.model_dump() for hotel in hotels],
-        "hotel_recommendations": hotels,
+        "hotel_results": [h.model_dump() for h in ranked],
+        "hotel_recommendations": ranked,
+        "errors": errors,
     }
 
 
@@ -369,9 +426,19 @@ def budget_node(state: TravelState) -> TravelState:
     flights = state.get("flight_recommendations", [])
     flight_cost = flights[0].price if flights else 0.0
 
+    # Same trap as flights: hotel recommendations are alternatives *per
+    # destination*. Cost the best-scoring stay in each city, once.
+    hotels = state.get("hotel_recommendations", [])
+    best_by_destination: dict[str, HotelOption] = {}
+    for hotel in hotels:
+        current = best_by_destination.get(hotel.destination)
+        if current is None or hotel.score > current.score:
+            best_by_destination[hotel.destination] = hotel
+    hotel_cost = sum(h.total_price for h in best_by_destination.values())
+
     breakdown = BudgetBreakdown(
         flights=flight_cost,
-        hotels=sum(h.total_price for h in state.get("hotel_recommendations", [])),
+        hotels=hotel_cost,
         activities=sum(a.estimated_cost for a in state.get("activities", [])),
         restaurants=sum(r.price_estimate for r in state.get("restaurants", [])),
         transportation=sum(
