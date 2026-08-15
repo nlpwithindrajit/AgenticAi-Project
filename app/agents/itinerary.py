@@ -320,6 +320,7 @@ class ItineraryAgent:
 
         invented = 0
         bad_times = 0
+        duplicated = 0
         days: list[DayPlan] = []
 
         for index, destination in enumerate(destinations_by_day):
@@ -328,8 +329,14 @@ class ItineraryAgent:
             by_id = {c.id: c for c in candidates}
 
             items: list[ItineraryItem] = []
+            used: set[str] = set()
             for scheduled in proposed_by_day.get(day, []):
                 candidate = by_id.get(scheduled.id)
+                if scheduled.id in used:
+                    # Seen in practice: a model scheduling the same outbound
+                    # flight twice, which reads as two departures on one day.
+                    duplicated += 1
+                    continue
                 if candidate is None:
                     # The whole point of the catalogue: refuse unknown items.
                     invented += 1
@@ -345,6 +352,7 @@ class ItineraryAgent:
                         location=candidate.location,
                     )
                 )
+                used.add(scheduled.id)
 
             if not items and candidates:
                 # Either no LLM, or it returned nothing usable for this day.
@@ -368,6 +376,11 @@ class ItineraryAgent:
             )
         if bad_times:
             notes.append(f"dropped {bad_times} itinerary item(s) with unusable times")
+        if duplicated:
+            notes.append(
+                f"dropped {duplicated} duplicate itinerary item(s); each one is "
+                "scheduled at most once per day"
+            )
 
         return ItineraryResult(days=days, notes=notes)
 

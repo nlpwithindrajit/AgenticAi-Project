@@ -7,7 +7,9 @@ the test suite passes, with no keys set at all.
 from __future__ import annotations
 
 from functools import lru_cache
+from typing import Literal
 
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -36,14 +38,49 @@ class Settings(BaseSettings):
         """True when nothing was configured — worth warning about off-local."""
         return all("localhost" in o or "127.0.0.1" in o for o in self.allowed_origins)
 
-    # --- LLM (Milestone 2 onwards) --------------------------------------
+    # --- LLM ------------------------------------------------------------
+    # Either provider drives the agents. `auto` picks whichever key is
+    # present, preferring OpenAI when both are, so setting one key is all a
+    # deployment needs to do.
+    llm_provider: Literal["auto", "openai", "anthropic"] = "auto"
+
+    openai_api_key: str | None = None
+    openai_model: str = "gpt-4o-mini"
+
     anthropic_api_key: str | None = None
-    llm_model: str = "claude-opus-5"
+    anthropic_model: str = "claude-opus-5"
+
+    # Kept for compatibility with existing .env files that set LLM_MODEL.
+    # When set it overrides the chosen provider's model.
+    llm_model: str | None = None
     llm_effort: str = "medium"
 
     @property
+    def active_llm_provider(self) -> str | None:
+        """Which provider will actually be used, or None when no key is set."""
+        if self.llm_provider == "openai":
+            return "openai" if self.openai_api_key else None
+        if self.llm_provider == "anthropic":
+            return "anthropic" if self.anthropic_api_key else None
+        if self.openai_api_key:
+            return "openai"
+        if self.anthropic_api_key:
+            return "anthropic"
+        return None
+
+    @property
+    def active_llm_model(self) -> str:
+        if self.llm_model:
+            return self.llm_model
+        return (
+            self.openai_model
+            if self.active_llm_provider == "openai"
+            else self.anthropic_model
+        )
+
+    @property
     def llm_enabled(self) -> bool:
-        return bool(self.anthropic_api_key)
+        return self.active_llm_provider is not None
 
     # --- Amadeus Self-Service (flights, Milestone 2) --------------------
     # Test env has limited inventory; switch the base URL for production.
@@ -64,7 +101,13 @@ class Settings(BaseSettings):
     # --- Langfuse (Milestone 6) -----------------------------------------
     langfuse_public_key: str | None = None
     langfuse_secret_key: str | None = None
-    langfuse_host: str = "https://cloud.langfuse.com"
+    # Accept LANGFUSE_BASE_URL too: it is what the Langfuse dashboard shows,
+    # and a host set under that name would otherwise be silently ignored while
+    # traces went to the wrong region.
+    langfuse_host: str = Field(
+        default="https://cloud.langfuse.com",
+        validation_alias=AliasChoices("LANGFUSE_HOST", "LANGFUSE_BASE_URL"),
+    )
     # Bounded so an unreachable Langfuse cannot add seconds to a request.
     # Measured: an unroutable host costs ~3s per request at the SDK default.
     langfuse_timeout_seconds: int = 3

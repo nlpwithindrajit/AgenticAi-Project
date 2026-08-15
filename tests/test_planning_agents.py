@@ -378,6 +378,31 @@ def test_clashing_times_are_separated() -> None:
     assert len(times) == len(set(times))
 
 
+def test_the_same_item_cannot_be_scheduled_twice() -> None:
+    """Seen from a real model: the outbound flight scheduled at 09:00 and
+    again at 18:00, which reads as two departures on one day."""
+    request = _request()
+    days = destinations_by_day(
+        request.destinations, request.departure_date, request.return_date
+    )
+    plan = ItineraryPlan(
+        days=[
+            {
+                "day": 1,
+                "items": [
+                    {"id": "d1-flight-out", "time": "09:00"},
+                    {"id": "d1-flight-out", "time": "18:00"},
+                ],
+            }
+        ]
+    )
+    result = ItineraryAgent(llm=_StubLLM(plan)).build(request, days, **_inventory())
+
+    flights = [i for i in result.days[0].items if i.kind == "flight"]
+    assert len(flights) == 1
+    assert any("duplicate" in n for n in result.notes)
+
+
 def test_itinerary_falls_back_when_the_llm_fails() -> None:
     request = _request()
     days = destinations_by_day(
