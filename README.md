@@ -77,6 +77,26 @@ curl -X POST http://127.0.0.1:8000/plan-trip \
 
 Interactive docs at <http://127.0.0.1:8000/docs>.
 
+### Run it from the venv, not a global Python
+
+Always invoke through `.venv/bin/python -m …` (or `source .venv/bin/activate`
+first). A bare `uvicorn app.main:app` picks up whatever Python is on `PATH` —
+often a conda base environment — and that fails before any project code loads:
+
+```
+TypeError: Router.__init__() got an unexpected keyword argument 'on_startup'
+```
+
+That is a **FastAPI/Starlette version mismatch in the ambient environment**, not
+a bug here: FastAPI below 0.141 passes `on_startup` to Starlette's `Router`,
+which Starlette 1.x removed. `requirements.txt` pins a floor that avoids the
+pair, but only inside the venv. Check what you are actually running with:
+
+```bash
+.venv/bin/python -c "import fastapi, starlette; print(fastapi.__version__, starlette.__version__)"
+# expect 0.141.1 1.6.0 or newer
+```
+
 ## The graph
 
 ```
