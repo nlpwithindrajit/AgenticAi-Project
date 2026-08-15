@@ -7,13 +7,12 @@ costed budget — with an explanation of why each option was chosen.
 Full design: [`projectIdea.md`](./projectIdea.md). Working agreements:
 [`CLAUDE.md`](./CLAUDE.md).
 
-## Status — Milestones 1-4 complete
+## Status — Milestones 1-5 complete
 
 What is **real**:
 
 - `TravelRequest` / `TripPlan` Pydantic schemas and the shared `TravelState`
 - The full LangGraph topology, including **both feedback loops**
-- The Review agent's validation checks (dates, coverage, budget, conflicts)
 - **Flights, end to end**: Amadeus Self-Service search, IATA resolution,
   explainable filtering and ranking, and an LLM that plans the search and
   writes the recommendation rationale
@@ -22,6 +21,8 @@ What is **real**:
   LLM-plans / tool-executes split
 - **Activities and restaurants**: Amadeus Tours & Activities and Points of
   Interest, anchored on the hotel we recommended, scheduled one per day
+- **Budget, Itinerary and Review agents**, and a replanning loop that changes
+  what the next pass actually searches for
 - `POST /plan-trip` and `GET /health` on FastAPI
 - Retry-bounded loops, so a bad edit fails loudly instead of hanging
 
@@ -29,15 +30,13 @@ What is **stubbed**: transport only. It invents deterministic inventory
 labelled `STUB` so the graph runs end to end with **no API keys at all**.
 Nothing user-visible from a stub can be mistaken for a real
 search result — and when Amadeus is unconfigured or errors, every search node
-falls back to stub inventory *and says so in `TripPlan.errors`*. Milestone 5
-puts the Budget, Itinerary and Review agents on real data; the state contract
-does not change.
+falls back to stub inventory *and says so in `TripPlan.errors`*.
 
 ## Quickstart
 
 ```bash
 make install                        # uv sync — creates .venv from uv.lock
-make test                           # 147 tests, no keys needed (HTTP is mocked)
+make test                           # 196 tests, no keys needed (HTTP is mocked)
 make dev                            # API with auto-reload on :8000
 ```
 
@@ -171,7 +170,8 @@ app/
 ├── main.py          # FastAPI entry: /health, /plan-trip
 ├── config.py        # env settings; every integration optional
 ├── graph/           # state.py, nodes.py, graph.py — LangGraph wiring
-├── agents/          # flight, hotel, activity, restaurant — reasoning agents
+├── agents/          # flight, hotel, activity, restaurant,
+│                 #   budget, itinerary, reviewer — reasoning agents
 ├── tools/           # amadeus.py (transport), flights, hotels, places
 ├── services/        # langfuse.py — trace seam    (Milestone 6 fills it in)
 └── models/          # travel.py — Pydantic schemas
@@ -303,11 +303,49 @@ Unlike flights and hotels, these two produce a **schedule** — one per day, no
 repeats — which is precisely why the Budget agent sums them directly. The full
 ranked candidate sets go to `activity_results` / `restaurant_results`.
 
+### Planning: budget, itinerary, review (Milestone 5)
+
+These three are where an LLM is most useful *and* most dangerous, so each is
+scoped to the judgement its job actually needs.
+
+**Budget** — `app/agents/budget.py`. **No total is ever produced by a model.**
+`compute()` is plain Python and is the only thing that touches money. The LLM
+contributes one judgement the arithmetic cannot make: when a trip does not fit,
+*which* category should give way, and by how much. Its choice is rejected if it
+names a category that costs nothing, which would burn a retry without saving
+anything.
+
+**Itinerary** — `app/agents/itinerary.py`. An itinerary is the easiest thing in
+this project to hallucinate: a model asked to "write a day in Tokyo" will
+invent a restaurant. So the agent never writes one. It is handed a
+**catalogue** of items that already exist, each with an opaque id, and may only
+return `(id, time)` pairs. Anything not in the catalogue is dropped and
+recorded; a day left with nothing falls back to deterministic times. The model
+can reorder a day. It cannot add to it.
+
+**Review** — `app/agents/reviewer.py`. Rule checks are authoritative and decide
+the PASS/FAIL edge: dates, coverage, budget, same-time clashes, a night with no
+bed. The LLM adds a second pass for plans that are individually valid but
+collectively silly — and every finding must cite a day that exists, so a model
+cannot fail a trip for a day that was never in it.
+
+**The replanning loop actually replans.** A review failure is translated into
+directives (`replan_guidance`) and a `cost_pressure` multiplier that tightens
+the next search's price caps. Without that, a replan re-ran the identical
+search and failed identically until the retry budget ran out. Sizing the cut to
+close the measured gap also made the budget loop converge in one iteration
+instead of two.
+
+Both loops stay bounded. A genuinely impossible trip — three cities in one day —
+comes back `FAIL` with the reason and the guidance recorded, rather than
+looping forever or quietly passing.
+
 ## Configuration
 
 Copy `.env.example` to `.env`. Nothing in it is required to run the graph —
 Amadeus credentials switch flights, hotels, activities and restaurants from
-stub to real.
+stub to real. `ANTHROPIC_API_KEY` switches the seven agents from deterministic
+fallbacks to real reasoning; every one of them works without it.
 
 ## Roadmap
 
@@ -317,8 +355,8 @@ stub to real.
 | 2 | Flight Agent — Amadeus search, filter, rank | done |
 | 3 | Hotel Agent — weighted ranking (price 30 / location 25 / rating 20 / amenities 15 / prefs 10) | done |
 | 4 | Activity + Restaurant Agents | done |
-| 5 | Budget / Itinerary / Review agents on real data | next |
-| 6 | Langfuse instrumentation | |
+| 5 | Budget / Itinerary / Review agents + replanning loop | done |
+| 6 | Langfuse instrumentation | next |
 | 7 | Next.js UI on Vercel | |
 | 8 | Docker → ECR → AWS App Runner | |
 

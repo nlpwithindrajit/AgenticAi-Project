@@ -203,10 +203,24 @@ class FlightAgent:
 
     # -- the whole job ---------------------------------------------------
 
-    def run(self, request: TravelRequest) -> FlightResult:
-        """Search, filter, rank and explain. Raises FlightSearchError upward."""
+    def run(
+        self, request: TravelRequest, *, cost_pressure: float = 1.0
+    ) -> FlightResult:
+        """Search, filter, rank and explain. Raises FlightSearchError upward.
+
+        `cost_pressure` below 1.0 tightens the price cap — that is how a
+        budget replan actually searches cheaper instead of repeating itself.
+        """
         notes: list[str] = []
         plan = self.plan_search(request)
+        if cost_pressure < 1.0 and plan.max_price is not None:
+            plan = plan.model_copy(
+                update={"max_price": round(plan.max_price * cost_pressure, 2)}
+            )
+            notes.append(
+                f"budget pressure: flight cap tightened to {plan.max_price:,.0f} "
+                f"{request.currency}"
+            )
         if plan.reasoning:
             notes.append(f"search plan: {plan.reasoning}")
 
