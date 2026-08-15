@@ -59,7 +59,13 @@ for kind in $TARGETS; do
   # linux/amd64 explicitly: building on an Apple Silicon machine otherwise
   # produces an arm64 image that Fargate refuses to start, and the task just
   # stops with "exec format error" buried in CloudWatch.
-  docker buildx build --platform linux/amd64 "${build_args[@]}" \
+  #
+  # ${build_args[@]+"${build_args[@]}"} rather than a plain "${build_args[@]}":
+  # macOS ships bash 3.2, where expanding an empty array under `set -u` is an
+  # "unbound variable" error. The api branch sets build_args=(), so the plain
+  # form aborts the deploy before the first image is built. Bash 4.4 fixed
+  # this, which is why CI (ubuntu) never saw it.
+  docker buildx build --platform linux/amd64 ${build_args[@]+"${build_args[@]}"} \
     -t "$image" -t "$REGISTRY/$repo:latest" --push "$context"
 
   say "Rolling $kind"
