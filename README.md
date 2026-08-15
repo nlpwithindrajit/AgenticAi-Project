@@ -36,16 +36,33 @@ does not change.
 ## Quickstart
 
 ```bash
-uv sync                             # creates .venv and installs from uv.lock
-
-uv run pytest                       # 147 tests, no keys needed (HTTP is mocked)
-uv run ruff check .
-uv run uvicorn app.main:app --reload
+make install                        # uv sync — creates .venv from uv.lock
+make test                           # 147 tests, no keys needed (HTTP is mocked)
+make dev                            # API with auto-reload on :8000
 ```
 
-`uv run` resolves the environment itself — no activation step, and no way to
-accidentally run against a system or conda Python. `uv sync` even fetches the
-right interpreter if you don't have it.
+`make env` prints which interpreter and package versions are actually in use —
+run it first whenever something looks wrong.
+
+Every target goes through `uv run`, which resolves the environment itself: no
+activation step, and **no way to accidentally run against a system or conda
+Python**. `uv sync` even fetches the right interpreter if you don't have it.
+
+<details>
+<summary>The equivalent commands, if you'd rather not use make</summary>
+
+```bash
+uv sync
+uv run pytest
+uv run ruff check .
+uv run uvicorn app.main:app --reload --reload-dir app
+```
+
+Two things must not be dropped: the `uv run` prefix, and `--reload-dir app`.
+Without the prefix you get whatever Python is on `PATH`; without the flag the
+reloader walks the whole repo — including `.venv` and any `.claude/worktrees/*`
+— and any file churn there sends it into a reload loop.
+</details>
 
 <details>
 <summary>Without uv (pip)</summary>
@@ -55,7 +72,7 @@ python3.11 -m venv .venv
 .venv/bin/pip install -r requirements-dev.txt
 
 .venv/bin/python -m pytest
-.venv/bin/python -m uvicorn app.main:app --reload
+.venv/bin/python -m uvicorn app.main:app --reload --reload-dir app
 ```
 
 Keep the `.venv/bin/python -m` prefix — see the troubleshooting note below.
