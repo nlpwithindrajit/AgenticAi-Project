@@ -7,7 +7,7 @@ costed budget — with an explanation of why each option was chosen.
 Full design: [`projectIdea.md`](./projectIdea.md). Working agreements:
 [`CLAUDE.md`](./CLAUDE.md).
 
-## Status — Milestones 1-3 complete
+## Status — Milestones 1-4 complete
 
 What is **real**:
 
@@ -20,16 +20,18 @@ What is **real**:
 - **Hotels, end to end**: Amadeus hotel list + pricing + guest ratings, a
   per-destination stay split, distance-from-centre scoring, and the same
   LLM-plans / tool-executes split
+- **Activities and restaurants**: Amadeus Tours & Activities and Points of
+  Interest, anchored on the hotel we recommended, scheduled one per day
 - `POST /plan-trip` and `GET /health` on FastAPI
 - Retry-bounded loops, so a bad edit fails loudly instead of hanging
 
-What is **stubbed**: activities, restaurants and transport. They invent
-deterministic inventory labelled `STUB` so the graph runs end to end with **no
-API keys at all**. Nothing user-visible from a stub can be mistaken for a real
-search result — and when Amadeus is unconfigured or errors, the flight node
-falls back to stub inventory *and says so in `TripPlan.errors`*. Milestones 4-5
-replace each remaining stub with a reasoning agent (`app/agents/`) driving a
-deterministic tool client (`app/tools/`); the state contract does not change.
+What is **stubbed**: transport only. It invents deterministic inventory
+labelled `STUB` so the graph runs end to end with **no API keys at all**.
+Nothing user-visible from a stub can be mistaken for a real
+search result — and when Amadeus is unconfigured or errors, every search node
+falls back to stub inventory *and says so in `TripPlan.errors`*. Milestone 5
+puts the Budget, Itinerary and Review agents on real data; the state contract
+does not change.
 
 ## Quickstart
 
@@ -37,13 +39,13 @@ deterministic tool client (`app/tools/`); the state contract does not change.
 uv venv --python 3.11
 uv pip install -r requirements-dev.txt
 
-.venv/bin/python -m pytest          # 101 tests, no keys needed (HTTP is mocked)
+.venv/bin/python -m pytest          # 147 tests, no keys needed (HTTP is mocked)
 .venv/bin/python -m ruff check .
 .venv/bin/python -m uvicorn app.main:app --reload
 ```
 
-To search **real flights and hotels**, add free Amadeus Self-Service
-credentials to `.env`:
+To search **real flights, hotels, activities and restaurants**, add free
+Amadeus Self-Service credentials to `.env`:
 
 ```bash
 cp .env.example .env
@@ -52,8 +54,8 @@ cp .env.example .env
 
 The Amadeus test tier has limited inventory and non-live prices, so expect
 fewer offers than production — switch `AMADEUS_BASE_URL` when you have
-production keys. `ANTHROPIC_API_KEY` is optional: without it the Flight agent
-falls back to a deterministic search plan and rule-based explanations.
+production keys. `ANTHROPIC_API_KEY` is optional: without it every agent falls
+back to a deterministic search plan and rule-based explanations.
 
 Then:
 
@@ -104,8 +106,8 @@ app/
 ├── main.py          # FastAPI entry: /health, /plan-trip
 ├── config.py        # env settings; every integration optional
 ├── graph/           # state.py, nodes.py, graph.py — LangGraph wiring
-├── agents/          # flight.py, hotel.py — reasoning agents
-├── tools/           # amadeus.py (transport), flights.py, hotels.py
+├── agents/          # flight, hotel, activity, restaurant — reasoning agents
+├── tools/           # amadeus.py (transport), flights, hotels, places
 ├── services/        # langfuse.py — trace seam    (Milestone 6 fills it in)
 └── models/          # travel.py — Pydantic schemas
 tests/
@@ -187,10 +189,60 @@ A multi-destination trip is split into contiguous stays (5 nights over Tokyo +
 Kyoto becomes 3 + 2, with no gap between check-out and the next check-in), and
 each destination is searched, ranked and costed separately.
 
+### Activities and restaurants (Milestone 4)
+
+Both search around an **anchor point**, resolved in this order:
+
+1. The hotel we actually recommended — things near where the traveller sleeps
+   beat things near an abstract centre, and the graph runs the hotel node first.
+2. The city centre from Amadeus City Search.
+
+If neither is obtainable the agent raises rather than guessing: searching from
+an arbitrary point returns plausible results for the wrong place.
+
+**Activities** come from Tours & Activities, which carries a real price.
+
+| Factor | Weight |
+|---|---|
+| Rating | 35% |
+| Price | 30% |
+| Interest match | 25% |
+| Proximity to the anchor | 10% |
+
+An activity with no published price is **kept and flagged**
+(`cost_is_estimated`) rather than dropped — dropping it would hide free
+attractions, and pricing it at zero would understate the budget.
+
+**Restaurants** come from Points of Interest, which returns **no pricing at
+all**. That gap is the defining constraint of this agent, and the two halves
+are kept strictly apart:
+
+- the **venue** is real, from the provider — `projectIdea.md` §11 is explicit
+  that this agent must never invent one;
+- the **price** is estimated from the traveller's per-person daily budget and
+  trip style, always flagged `price_is_estimated`, and always carries the
+  `estimate_basis` sentence explaining where the number came from.
+
+| Factor | Weight |
+|---|---|
+| Provider relevance (response order) | 40% |
+| Dietary match from tags | 30% |
+| Proximity to the anchor | 20% |
+| Cuisine identifiable | 10% |
+
+Relevance uses **response order**, not the `rank` field, whose scale Amadeus
+does not document. When dietary preferences cannot be confirmed from tags, the
+plan says so rather than implying the venues were vetted.
+
+Unlike flights and hotels, these two produce a **schedule** — one per day, no
+repeats — which is precisely why the Budget agent sums them directly. The full
+ranked candidate sets go to `activity_results` / `restaurant_results`.
+
 ## Configuration
 
 Copy `.env.example` to `.env`. Nothing in it is required to run the graph —
-Amadeus credentials switch flights and hotels from stub to real.
+Amadeus credentials switch flights, hotels, activities and restaurants from
+stub to real.
 
 ## Roadmap
 
@@ -199,8 +251,8 @@ Amadeus credentials switch flights and hotels from stub to real.
 | 1 | Foundation — FastAPI, graph skeleton, both loops | done |
 | 2 | Flight Agent — Amadeus search, filter, rank | done |
 | 3 | Hotel Agent — weighted ranking (price 30 / location 25 / rating 20 / amenities 15 / prefs 10) | done |
-| 4 | Activity + Restaurant Agents | next |
-| 5 | Budget / Itinerary / Review agents on real data | |
+| 4 | Activity + Restaurant Agents | done |
+| 5 | Budget / Itinerary / Review agents on real data | next |
 | 6 | Langfuse instrumentation | |
 | 7 | Next.js UI on Vercel | |
 | 8 | Docker → ECR → AWS App Runner | |

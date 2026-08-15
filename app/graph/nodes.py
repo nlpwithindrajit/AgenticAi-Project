@@ -16,8 +16,10 @@ from __future__ import annotations
 import logging
 from datetime import timedelta
 
+from app.agents.activity import ActivityAgent
 from app.agents.flight import FlightAgent
 from app.agents.hotel import HotelAgent, split_stay
+from app.agents.restaurant import RestaurantAgent
 from app.config import get_settings
 from app.graph.state import (
     MAX_BUDGET_RETRIES,
@@ -41,9 +43,14 @@ from app.models.travel import (
     TransportLeg,
     TripRequirements,
 )
-from app.tools.amadeus import FlightSearchError, HotelSearchError
+from app.tools.amadeus import (
+    FlightSearchError,
+    HotelSearchError,
+    PlacesSearchError,
+)
 from app.tools.flights import rank_flights
 from app.tools.hotels import detect_amenities, rank_hotels
+from app.tools.places import estimate_meal_cost
 
 logger = logging.getLogger(__name__)
 
@@ -343,54 +350,150 @@ def hotel_node(state: TravelState) -> TravelState:
     }
 
 
-def activity_node(state: TravelState) -> TravelState:
-    """Activity agent — draws candidates from a places search tool."""
+def _days_by_destination(state: TravelState) -> dict[str, list[int]]:
+    """{destination: [day numbers spent there]}, in itinerary order."""
+    mapping: dict[str, list[int]] = {}
+    for index, destination in enumerate(_destinations_by_day(state)):
+        mapping.setdefault(destination, []).append(index + 1)
+    return mapping
+
+
+def _stub_activities(state: TravelState) -> list[Activity]:
+    """Placeholder inventory, used only when Amadeus is not configured."""
     request = state["request"]
     budget_share = request.budget * _STUB_BUDGET_SHARE["activities"]
     schedule = _destinations_by_day(state)
     per_activity = budget_share / max(len(schedule), 1)
 
-    activities = [
+    return [
         Activity(
-            activity=f"STUB attraction in {destination}",
-            category=(request.interests[0] if request.interests else "sightseeing"),
+            activity_id=f"stub-act-{day}",
+            activity=f"STUB attraction {day} in {destination}",
+            category="activity",
             destination=destination,
+            description=f"STUB placeholder activity in {destination} for day {day}",
             duration_hours=2.0,
             estimated_cost=round(per_activity, 2),
+            cost_is_estimated=True,
             currency=request.currency,
+            rating=4.2,
             recommended_day=day,
+            source="stub",
         )
         for day, destination in enumerate(schedule, start=1)
     ]
+
+
+def _stub_restaurants(state: TravelState) -> list[Restaurant]:
+    """Placeholder inventory, used only when Amadeus is not configured."""
+    request = state["request"]
+    meal_cost, basis = estimate_meal_cost(
+        request.budget,
+        request.travelers,
+        request.duration_days,
+        request.trip_style,
+    )
+    schedule = _destinations_by_day(state)
+
+    return [
+        Restaurant(
+            place_id=f"stub-rest-{day}",
+            name=f"STUB restaurant {day} in {destination}",
+            destination=destination,
+            meal="dinner",
+            price_estimate=meal_cost,
+            price_is_estimated=True,
+            estimate_basis=basis,
+            currency=request.currency,
+            dietary_tags=list(request.dietary_preferences),
+            recommended_day=day,
+            source="stub",
+        )
+        for day, destination in enumerate(schedule, start=1)
+    ]
+
+
+def activity_node(state: TravelState) -> TravelState:
+    """Activity agent — draws candidates from a real places search.
+
+    Writes a *schedule* (one activity per day) to `activities`, and the full
+    ranked candidate set to `activity_results`. The Budget agent sums the
+    schedule, so these must never be alternatives.
+    """
+    request = state["request"]
+    errors = list(state.get("errors", []))
+    settings = get_settings()
+
+    if settings.amadeus_enabled:
+        try:
+            result = ActivityAgent().run(
+                request,
+                days_by_destination=_days_by_destination(state),
+                hotels=state.get("hotel_recommendations"),
+            )
+            errors.extend(result.notes)
+            if result.scheduled:
+                return {
+                    "activity_results": [a.model_dump() for a in result.candidates],
+                    "activities": result.scheduled,
+                    "errors": errors,
+                }
+            errors.append("activity search returned nothing; using STUB inventory")
+        except PlacesSearchError as exc:
+            errors.append(f"activity search failed ({exc}); using STUB inventory")
+        except Exception as exc:  # pragma: no cover - unexpected provider fault
+            logger.exception("unexpected activity search failure")
+            errors.append(f"activity search error ({exc}); using STUB inventory")
+    else:
+        errors.append("Amadeus not configured; using STUB activity inventory")
+
+    stubs = _stub_activities(state)
     return {
-        "activity_results": [activity.model_dump() for activity in activities],
-        "activities": activities,
+        "activity_results": [a.model_dump() for a in stubs],
+        "activities": stubs,
+        "errors": errors,
     }
 
 
 def restaurant_node(state: TravelState) -> TravelState:
-    """Restaurant agent — must draw from search results, never invent venues."""
-    request = state["request"]
-    budget_share = request.budget * _STUB_BUDGET_SHARE["restaurants"]
-    schedule = _destinations_by_day(state)
-    per_meal = budget_share / max(len(schedule), 1)
+    """Restaurant agent — venues from a places search, prices estimated.
 
-    restaurants = [
-        Restaurant(
-            name=f"STUB restaurant in {destination}",
-            destination=destination,
-            meal="dinner",
-            price_estimate=round(per_meal, 2),
-            currency=request.currency,
-            rating=4.4,
-            dietary_tags=list(request.dietary_preferences),
-            recommended_day=day,
-        )
-        for day, destination in enumerate(schedule, start=1)
-    ]
+    projectIdea.md §11: this agent must never invent venues. Amadeus returns no
+    restaurant pricing, so every `price_estimate` is flagged and carries the
+    basis it was derived from.
+    """
+    request = state["request"]
+    errors = list(state.get("errors", []))
+    settings = get_settings()
+
+    if settings.amadeus_enabled:
+        try:
+            result = RestaurantAgent().run(
+                request,
+                days_by_destination=_days_by_destination(state),
+                hotels=state.get("hotel_recommendations"),
+            )
+            errors.extend(result.notes)
+            if result.scheduled:
+                return {
+                    "restaurant_results": [r.model_dump() for r in result.candidates],
+                    "restaurants": result.scheduled,
+                    "errors": errors,
+                }
+            errors.append("restaurant search returned nothing; using STUB inventory")
+        except PlacesSearchError as exc:
+            errors.append(f"restaurant search failed ({exc}); using STUB inventory")
+        except Exception as exc:  # pragma: no cover - unexpected provider fault
+            logger.exception("unexpected restaurant search failure")
+            errors.append(f"restaurant search error ({exc}); using STUB inventory")
+    else:
+        errors.append("Amadeus not configured; using STUB restaurant inventory")
+
+    stubs = _stub_restaurants(state)
     return {
-        "restaurant_results": [r.model_dump() for r in restaurants],
-        "restaurants": restaurants,
+        "restaurant_results": [r.model_dump() for r in stubs],
+        "restaurants": stubs,
+        "errors": errors,
     }
 
 

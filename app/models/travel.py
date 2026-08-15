@@ -188,27 +188,67 @@ class HotelOption(BaseModel):
 
 
 class Activity(BaseModel):
+    """One bookable activity, scheduled on a specific day.
+
+    Unlike flights and hotels, activities are a *schedule* rather than a list of
+    alternatives — one per day — so the Budget agent sums them all.
+    """
+
+    activity_id: str | None = None
     activity: str
     category: str
     destination: str
+    description: str | None = None
+
     duration_hours: float | None = None
     estimated_cost: float = 0.0
+    """A real quoted price when the provider gave one; see `cost_is_estimated`."""
+    cost_is_estimated: bool = False
     currency: str = "INR"
+
+    rating: float | None = None
+    latitude: float | None = None
+    longitude: float | None = None
+    distance_km: float | None = None
+    booking_link: str | None = None
+
     location: str | None = None
     recommended_day: int | None = None
+    score: float = 0.0
+    rationale: str | None = None
+    source: Literal["amadeus", "stub"] = "amadeus"
 
 
 class Restaurant(BaseModel):
+    """One restaurant suggestion, scheduled on a specific day.
+
+    Amadeus points of interest carry no price, so `price_estimate` is exactly
+    that — an estimate from `estimate_basis`, never a quoted figure.
+    """
+
+    place_id: str | None = None
     name: str
     destination: str
     cuisine: str | None = None
     meal: Literal["breakfast", "lunch", "dinner"] = "dinner"
+
     price_estimate: float = 0.0
+    price_is_estimated: bool = True
+    estimate_basis: str | None = None
     currency: str = "INR"
+
     rating: float | None = None
+    latitude: float | None = None
+    longitude: float | None = None
+    distance_km: float | None = None
+
     location: str | None = None
+    tags: list[str] = Field(default_factory=list)
     dietary_tags: list[str] = Field(default_factory=list)
     recommended_day: int | None = None
+    score: float = 0.0
+    rationale: str | None = None
+    source: Literal["amadeus", "stub"] = "amadeus"
 
 
 class TransportLeg(BaseModel):

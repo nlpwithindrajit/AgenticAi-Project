@@ -131,6 +131,44 @@ def test_stub_hotels_are_labelled(sample_request: TravelRequest) -> None:
     assert any("Amadeus not configured" in e for e in plan.errors)
 
 
+def test_activities_and_restaurants_are_a_schedule_not_alternatives(
+    sample_request: TravelRequest,
+) -> None:
+    """One per day, no repeats — this is why the Budget agent may sum them."""
+    plan = plan_trip(sample_request)
+    days = list(range(1, sample_request.duration_days + 1))
+
+    assert [a.recommended_day for a in plan.activities] == days
+    assert [r.recommended_day for r in plan.restaurants] == days
+    assert len({a.activity for a in plan.activities}) == len(plan.activities)
+
+    assert plan.budget is not None
+    assert plan.budget.breakdown.activities == pytest.approx(
+        sum(a.estimated_cost for a in plan.activities)
+    )
+    assert plan.budget.breakdown.restaurants == pytest.approx(
+        sum(r.price_estimate for r in plan.restaurants)
+    )
+
+
+def test_restaurant_prices_are_never_presented_as_quotes(
+    sample_request: TravelRequest,
+) -> None:
+    plan = plan_trip(sample_request)
+
+    assert plan.restaurants
+    assert all(r.price_is_estimated for r in plan.restaurants)
+    assert all(r.estimate_basis for r in plan.restaurants)
+
+
+def test_notes_are_not_duplicated_by_the_replan_loops(
+    sample_request: TravelRequest,
+) -> None:
+    """A standing condition must not be repeated once per loop iteration."""
+    plan = plan_trip(sample_request)
+    assert len(plan.errors) == len(set(plan.errors))
+
+
 def test_every_hotel_score_component_is_exercised(
     sample_request: TravelRequest,
 ) -> None:

@@ -97,6 +97,22 @@ def plan_trip(request: TravelRequest, trace_id: str | None = None) -> TripPlan:
     return to_trip_plan(final_state)
 
 
+def _dedupe(notes: list[str]) -> list[str]:
+    """Collapse identical notes, keeping first-seen order.
+
+    Every replan pass re-runs the search nodes, so a standing condition like
+    "Amadeus not configured" would otherwise be repeated once per loop and bury
+    the notes that only fired once.
+    """
+    seen: set[str] = set()
+    unique: list[str] = []
+    for note in notes:
+        if note not in seen:
+            seen.add(note)
+            unique.append(note)
+    return unique
+
+
 def to_trip_plan(state: TravelState) -> TripPlan:
     return TripPlan(
         request=state["request"],
@@ -109,6 +125,6 @@ def to_trip_plan(state: TravelState) -> TripPlan:
         daily_itinerary=state.get("daily_itinerary", []),
         budget=state.get("budget"),
         review=state.get("review"),
-        errors=state.get("errors", []),
+        errors=_dedupe(state.get("errors", [])),
         trace_id=state.get("trace_id"),
     )

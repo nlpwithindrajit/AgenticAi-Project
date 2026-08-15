@@ -43,6 +43,10 @@ class HotelSearchError(AmadeusError):
     """Raised when hotels cannot be searched."""
 
 
+class PlacesSearchError(AmadeusError):
+    """Raised when activities or points of interest cannot be searched."""
+
+
 @contextmanager
 def _as(error_type: type[AmadeusError]) -> Iterator[None]:
     """Re-raise a transport-level AmadeusError as a domain-specific one.
@@ -283,6 +287,55 @@ class AmadeusClient:
             return self._get(
                 "/v2/e-reputation/hotel-sentiments",
                 {"hotelIds": ",".join(hotel_ids[:MAX_HOTEL_IDS_PER_CALL])},
+            )
+
+    # -- places ----------------------------------------------------------
+
+    def search_cities(self, keyword: str, max_results: int = 1) -> dict[str, Any]:
+        """City reference data, including a real city-centre `geoCode`."""
+        with _as(PlacesSearchError):
+            return self._get(
+                "/v1/reference-data/locations/cities",
+                {"keyword": keyword, "max": max_results},
+            )
+
+    def search_activities(
+        self, latitude: float, longitude: float, radius_km: int = 5
+    ) -> dict[str, Any]:
+        """Bookable tours and activities around a point.
+
+        Unlike points of interest, these carry a real price, which is what the
+        Budget agent needs.
+        """
+        with _as(PlacesSearchError):
+            return self._get(
+                "/v1/shopping/activities",
+                {"latitude": latitude, "longitude": longitude, "radius": radius_km},
+            )
+
+    def search_points_of_interest(
+        self,
+        latitude: float,
+        longitude: float,
+        radius_km: int = 5,
+        categories: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Points of interest around a point.
+
+        Returns identity, category, tags and a relevance `rank` — but **no
+        price**, which is why restaurant costs have to be estimated rather than
+        quoted. Results arrive ordered by relevance.
+        """
+        params: dict[str, Any] = {
+            "latitude": latitude,
+            "longitude": longitude,
+            "radius": radius_km,
+        }
+        if categories:
+            params["categories"] = ",".join(categories)
+        with _as(PlacesSearchError):
+            return self._get(
+                "/v1/reference-data/locations/pointsOfInterest", params
             )
 
 
