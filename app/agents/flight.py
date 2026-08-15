@@ -16,7 +16,7 @@ import logging
 
 from pydantic import BaseModel, Field
 
-from app.config import get_settings
+from app.agents.llm import build_llm
 from app.models.travel import FlightOption, TravelRequest
 from app.tools.flights import (
     AmadeusClient,
@@ -93,29 +93,7 @@ class FlightAgent:
         return self._client
 
     def _get_llm(self):
-        """Build the chat model on first use; None when unconfigured."""
-        if self._llm is not None:
-            return self._llm
-
-        settings = get_settings()
-        if not settings.llm_enabled:
-            return None
-
-        try:
-            from langchain_anthropic import ChatAnthropic
-        except ImportError:  # pragma: no cover - depends on optional install
-            logger.warning(
-                "ANTHROPIC_API_KEY is set but langchain-anthropic is missing"
-            )
-            return None
-
-        # No temperature/top_p: those parameters are rejected outright by the
-        # current Claude models, so the request must simply omit them.
-        self._llm = ChatAnthropic(
-            model=settings.llm_model,
-            api_key=settings.anthropic_api_key,
-            max_tokens=2048,
-        )
+        self._llm = build_llm(self._llm)
         return self._llm
 
     # -- planning --------------------------------------------------------

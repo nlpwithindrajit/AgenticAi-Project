@@ -27,6 +27,7 @@ from typing import Any
 import httpx
 
 from app.config import get_settings
+from app.services.langfuse import observe, update_current
 
 logger = logging.getLogger(__name__)
 
@@ -144,6 +145,12 @@ class AmadeusClient:
         return token
 
     def _get(self, path: str, params: dict[str, Any]) -> dict[str, Any]:
+        """Every provider call is a `tool` observation, so the trace separates
+        what an agent decided from what the API actually returned."""
+        with observe(f"amadeus{path}", as_type="tool", input=_safe_params(params)):
+            return self._get_traced(path, params)
+
+    def _get_traced(self, path: str, params: dict[str, Any]) -> dict[str, Any]:
         token = self._access_token()
         try:
             response = self._client().get(
@@ -163,7 +170,12 @@ class AmadeusClient:
                 f"Amadeus {path} failed (HTTP {response.status_code}): "
                 f"{_error_detail(response)}"
             )
-        return response.json()
+
+        payload = response.json()
+        update_current(
+            output={"count": len(payload.get("data") or []), "status": 200}
+        )
+        return payload
 
     # -- reference data --------------------------------------------------
 
@@ -341,6 +353,13 @@ class AmadeusClient:
 
 # Amadeus rejects oversized hotelIds lists; keep calls comfortably under it.
 MAX_HOTEL_IDS_PER_CALL = 20
+
+
+def _safe_params(params: dict[str, Any]) -> dict[str, Any]:
+    """Query params for a trace. Amadeus search params carry no secrets, but
+    filter defensively so a future parameter cannot leak one."""
+    hidden = {"client_id", "client_secret", "password", "token"}
+    return {k: v for k, v in params.items() if k.lower() not in hidden}
 
 
 def _error_detail(response: httpx.Response) -> str:

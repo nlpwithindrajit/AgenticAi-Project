@@ -8,35 +8,12 @@ from __future__ import annotations
 
 import logging
 
-from app.config import get_settings
+from app.agents.llm import build_llm
 from app.tools.amadeus import AmadeusClient, AmadeusError, PlacesSearchError
 
 logger = logging.getLogger(__name__)
 
 Anchor = tuple[float, float]
-
-
-def build_llm(existing: object | None = None) -> object | None:
-    """The chat model, or None when unconfigured. Shared by both agents."""
-    if existing is not None:
-        return existing
-
-    settings = get_settings()
-    if not settings.llm_enabled:
-        return None
-
-    try:
-        from langchain_anthropic import ChatAnthropic
-    except ImportError:  # pragma: no cover - depends on optional install
-        logger.warning("ANTHROPIC_API_KEY is set but langchain-anthropic is missing")
-        return None
-
-    # No temperature/top_p — current Claude models reject them outright.
-    return ChatAnthropic(
-        model=settings.llm_model,
-        api_key=settings.anthropic_api_key,
-        max_tokens=2048,
-    )
 
 
 def resolve_anchor(

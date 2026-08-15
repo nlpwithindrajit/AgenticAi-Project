@@ -1,19 +1,23 @@
 """LangGraph node implementations.
 
-Milestone 1 status: the graph topology, the shared state, the budget loop and
-the review loop are real. The *search* nodes are deterministic placeholders —
-they invent clearly-labelled `STUB` inventory so the loops can be exercised
-end-to-end without any API keys. Milestones 2-5 replace each stub body with a
-reasoning agent (`app/agents/`) driving a deterministic tool client
-(`app/tools/`); the signatures and the state contract stay the same.
+Each node is a thin adapter: it pulls what it needs out of `TravelState`, hands
+it to an agent in `app/agents/`, and writes the result back. The reasoning
+lives in the agents; the API work lives in `app/tools/`.
 
-Anything user-visible produced here is prefixed `STUB` on purpose: no node in
-this module should ever be mistaken for a real search result.
+Every node is wrapped in a Langfuse observation by `@traced`, so a trace
+mirrors the graph exactly — repeats included, which is what makes a replan loop
+legible after the fact.
+
+Search nodes fall back to clearly-labelled `STUB` inventory when Amadeus is not
+configured, and record why in `state["errors"]`. Anything user-visible produced
+by a stub is prefixed `STUB` on purpose: nothing here should ever be mistaken
+for a real search result.
 """
 
 from __future__ import annotations
 
 import logging
+from functools import wraps
 
 from app.agents.activity import ActivityAgent
 from app.agents.budget import BudgetAgent
@@ -39,6 +43,7 @@ from app.models.travel import (
     TransportLeg,
     TripRequirements,
 )
+from app.services.langfuse import observe, update_current
 from app.tools.amadeus import (
     FlightSearchError,
     HotelSearchError,
@@ -49,6 +54,44 @@ from app.tools.hotels import detect_amenities, rank_hotels
 from app.tools.places import estimate_meal_cost
 
 logger = logging.getLogger(__name__)
+
+
+def traced(name: str, as_type: str = "agent"):
+    """Wrap a graph node in a Langfuse observation.
+
+    Applied at the node level rather than inside each agent so the trace
+    mirrors the graph exactly — including the repeats a loop produces, which
+    is precisely what you want to see when diagnosing a replan.
+    """
+
+    def decorate(node):
+        @wraps(node)
+        def wrapper(state: TravelState) -> TravelState:
+            with observe(name, as_type=as_type) as span:
+                update = node(state)
+                if span is not None:
+                    update_current(output=_node_summary(update))
+                return update
+
+        return wrapper
+
+    return decorate
+
+
+def _node_summary(update: TravelState) -> dict[str, object]:
+    """What a node produced, small enough to read in a trace."""
+    summary: dict[str, object] = {}
+    for key, value in (update or {}).items():
+        if key == "errors":
+            continue
+        if isinstance(value, list):
+            summary[key] = len(value)
+        elif isinstance(value, (str, int, float, bool)) or value is None:
+            summary[key] = value
+        else:
+            summary[key] = type(value).__name__
+    return summary
+
 
 # Share of the user's budget each category is assumed to consume in the stub
 # costing model. These deliberately sum to >1.0 so a default request trips the
@@ -82,6 +125,7 @@ def _destinations_by_day(state: TravelState) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
+@traced("planner", "agent")
 def planner_node(state: TravelState) -> TravelState:
     """Travel Planner — turns the raw request into plan requirements.
 
@@ -108,6 +152,7 @@ def planner_node(state: TravelState) -> TravelState:
     return {"requirements": requirements}
 
 
+@traced("destination", "agent")
 def destination_node(state: TravelState) -> TravelState:
     """Destination agent — enriches each destination with context."""
     request = state["request"]
@@ -192,6 +237,7 @@ def _stub_flight_offers(state: TravelState) -> list[FlightOption]:
     return offers
 
 
+@traced("flight-agent", "agent")
 def flight_node(state: TravelState) -> TravelState:
     """Flight agent — search -> filter -> rank -> recommend (never book).
 
@@ -286,6 +332,7 @@ def _stub_hotel_offers(state: TravelState) -> list[HotelOption]:
     return hotels
 
 
+@traced("hotel-agent", "agent")
 def hotel_node(state: TravelState) -> TravelState:
     """Hotel agent — search -> filter -> rank -> recommend (never book).
 
@@ -403,6 +450,7 @@ def _stub_restaurants(state: TravelState) -> list[Restaurant]:
     ]
 
 
+@traced("activity-agent", "agent")
 def activity_node(state: TravelState) -> TravelState:
     """Activity agent — draws candidates from a real places search.
 
@@ -445,6 +493,7 @@ def activity_node(state: TravelState) -> TravelState:
     }
 
 
+@traced("restaurant-agent", "agent")
 def restaurant_node(state: TravelState) -> TravelState:
     """Restaurant agent — venues from a places search, prices estimated.
 
@@ -487,6 +536,7 @@ def restaurant_node(state: TravelState) -> TravelState:
     }
 
 
+@traced("transportation", "agent")
 def transportation_node(state: TravelState) -> TravelState:
     """Approximate local transport: airport -> hotel -> attraction -> food."""
     request = state["request"]
@@ -509,6 +559,7 @@ def transportation_node(state: TravelState) -> TravelState:
     return {"transportation_plan": legs}
 
 
+@traced("budget-agent", "agent")
 def budget_node(state: TravelState) -> TravelState:
     """Budget agent — deterministic totals, LLM judgement on where to save.
 
@@ -548,6 +599,7 @@ def budget_node(state: TravelState) -> TravelState:
     return update
 
 
+@traced("itinerary-agent", "agent")
 def itinerary_node(state: TravelState) -> TravelState:
     """Itinerary agent — sequences existing inventory, never invents any.
 
@@ -570,6 +622,7 @@ def itinerary_node(state: TravelState) -> TravelState:
     return {"daily_itinerary": result.days, "errors": errors}
 
 
+@traced("review-agent", "agent")
 def review_node(state: TravelState) -> TravelState:
     """Review agent — rule checks decide the verdict; the LLM adds a second pass."""
     request = state["request"]
@@ -586,6 +639,7 @@ def review_node(state: TravelState) -> TravelState:
     return {"review": result}
 
 
+@traced("replan-budget", "span")
 def budget_replan_node(state: TravelState) -> TravelState:
     """Entered when the plan is over budget; bumps the loop counter."""
     budget = state.get("budget")
@@ -601,6 +655,7 @@ def budget_replan_node(state: TravelState) -> TravelState:
     }
 
 
+@traced("replan", "span")
 def replan_node(state: TravelState) -> TravelState:
     """Entered when the Review agent fails the plan; feeds the planner guidance.
 

@@ -52,6 +52,9 @@ class Settings(BaseSettings):
     langfuse_public_key: str | None = None
     langfuse_secret_key: str | None = None
     langfuse_host: str = "https://cloud.langfuse.com"
+    # Bounded so an unreachable Langfuse cannot add seconds to a request.
+    # Measured: an unroutable host costs ~3s per request at the SDK default.
+    langfuse_timeout_seconds: int = 3
 
     @property
     def langfuse_enabled(self) -> bool:
