@@ -157,6 +157,79 @@ def test_the_result_is_a_real_travel_request() -> None:
 
 
 # ---------------------------------------------------------------------------
+# The conversation with a model attached
+#
+# The deterministic path never sets `follow_up`, so these are the only tests
+# that exercise how a model's question interacts with the accumulated draft —
+# which is exactly where the loop was.
+# ---------------------------------------------------------------------------
+
+
+class _StubStructured:
+    def __init__(self, agent: _StubLLM) -> None:
+        self._agent = agent
+
+    def invoke(self, messages: object) -> TripDraft:
+        self._agent.prompts.append(str(messages))
+        return self._agent.value
+
+
+class _StubLLM:
+    """A model that answers with one fixed draft and records what it was asked."""
+
+    def __init__(self, value: TripDraft) -> None:
+        self.value = value
+        self.prompts: list[str] = []
+
+    def with_structured_output(self, _schema: type) -> _StubStructured:
+        return _StubStructured(self)
+
+
+def test_the_question_is_about_the_draft_not_the_last_message() -> None:
+    """The gap that matters is the conversation's, not this one sentence's.
+
+    A model shown only "3rd September" cannot see that the destination is
+    already known, so its `follow_up` asks for it again. Echoing that question
+    is what made the chat loop: the traveller answers, the draft is already
+    full, and the same question comes back.
+    """
+    known = TripDraft(destinations=["Bali"])
+    llm = _StubLLM(TripDraft(departure_date=date(2026, 9, 3)))
+
+    result = IntakeAgent(llm).read("3rd September", draft=known, today=TODAY)
+
+    assert result.draft.destinations == ["Bali"]
+    assert result.missing == ["origin", "budget"]
+    assert "destination" not in result.reply.lower()
+    assert "from" in result.reply.lower()
+
+
+def test_the_draft_carries_no_question_of_its_own() -> None:
+    """The draft is trip facts. A question stored in it is a question that can
+    go stale and be replayed a turn later."""
+    result = IntakeAgent(_StubLLM(TripDraft(origin="Mumbai"))).read(
+        "from Mumbai", today=TODAY
+    )
+
+    assert "follow_up" not in result.draft.model_dump()
+
+
+def test_the_model_is_told_what_is_already_known() -> None:
+    """Without the draft, "London" is a coin-flip between origin and destination."""
+    llm = _StubLLM(TripDraft(origin="London"))
+    known = TripDraft(destinations=["Bali"], departure_date=date(2026, 9, 3))
+
+    IntakeAgent(llm).read("London", draft=known, today=TODAY)
+
+    prompt = llm.prompts[0]
+    assert "Bali" in prompt
+    assert "2026-09-03" in prompt
+    # The unanswered fields have to be nameable, so a bare reply lands in the
+    # slot the traveller was actually asked about.
+    assert "origin" in prompt and "budget" in prompt
+
+
+# ---------------------------------------------------------------------------
 # The endpoint
 # ---------------------------------------------------------------------------
 
