@@ -24,6 +24,10 @@
       ],
       "secrets": [
         {
+          "name": "SERPAPI_API_KEY",
+          "valueFrom": "arn:aws:ssm:__REGION__:__ACCOUNT__:parameter/travel-planner/SERPAPI_API_KEY"
+        },
+        {
           "name": "OPENAI_API_KEY",
           "valueFrom": "arn:aws:ssm:__REGION__:__ACCOUNT__:parameter/travel-planner/OPENAI_API_KEY"
         },
