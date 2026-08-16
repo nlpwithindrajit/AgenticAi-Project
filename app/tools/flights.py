@@ -1,18 +1,21 @@
-"""Amadeus flight search: normalisation, filtering and explainable ranking.
+"""Flight search: normalisation, filtering and explainable ranking.
 
-Transport and auth live in `app/tools/amadeus.py`; this module turns raw
-Amadeus flight-offers JSON into `FlightOption` objects and scores them. No LLM
-calls belong here — the Flight agent makes the judgement calls.
+Transport lives in `app/tools/amadeus.py` and `app/tools/serpapi.py`; this
+module turns whichever provider's raw JSON into `FlightOption` objects and
+scores them. Filtering and ranking are provider-agnostic on purpose — once an
+offer is normalised, nothing downstream should care where it came from. No LLM
+calls belong here; the Flight agent makes the judgement calls.
 """
 
 from __future__ import annotations
 
 import logging
 import re
-from typing import Any
+from typing import Any, NamedTuple
 
 from app.models.travel import FlightOption, FlightSegment, FlightSlice
 from app.tools.amadeus import AmadeusClient, AmadeusError, FlightSearchError
+from app.tools.serpapi import SerpApiClient, SerpApiError
 
 logger = logging.getLogger(__name__)
 
@@ -136,6 +139,188 @@ def normalize_offers(
         )
 
     return options
+
+
+# ---------------------------------------------------------------------------
+# SerpAPI (Google Flights) parsing
+# ---------------------------------------------------------------------------
+
+
+def _iso_timestamp(value: str | None) -> str:
+    """"2026-10-10 08:10" -> "2026-10-10T08:10".
+
+    Google Flights separates date and time with a space. Everything
+    downstream — `_departure_hour`, the itinerary agent, the UI — reads these
+    as ISO-8601, so the space is normalised once, here, rather than each
+    reader having to know which provider produced the string.
+    """
+    if not value:
+        return ""
+    return value.strip().replace(" ", "T", 1)
+
+
+def _carrier_code(flight_number: str | None) -> str:
+    """"6E 1451" -> "6E". Google gives the airline name, not its IATA code."""
+    if not flight_number:
+        return ""
+    return flight_number.strip().split()[0].upper()
+
+
+def _segment_from_serpapi(raw: dict[str, Any]) -> FlightSegment:
+    departure = raw.get("departure_airport") or {}
+    arrival = raw.get("arrival_airport") or {}
+    number = raw.get("flight_number")
+    duration = raw.get("duration")
+    return FlightSegment(
+        carrier_code=_carrier_code(number),
+        carrier_name=raw.get("airline"),
+        flight_number=number.replace(" ", "") if number else None,
+        aircraft=raw.get("airplane"),
+        origin=departure.get("id", ""),
+        destination=arrival.get("id", ""),
+        departure_at=_iso_timestamp(departure.get("time")),
+        arrival_at=_iso_timestamp(arrival.get("time")),
+        duration_minutes=duration if isinstance(duration, int) else None,
+    )
+
+
+class SerpApiItinerary(NamedTuple):
+    """One direction of travel, at the total price of the trip it belongs to.
+
+    `price` is *not* this leg's fare: Google quotes the whole round trip
+    against whichever outbound option you are looking at, for all passengers
+    together. Keeping the two side by side is what lets the agent swap in a
+    return leg and take its price as the new total.
+    """
+
+    slice: FlightSlice
+    price: float
+    token: str | None
+
+
+def serpapi_itineraries(payload: dict[str, Any]) -> list[SerpApiItinerary]:
+    """Pull every itinerary out of a Google Flights payload, in Google's order.
+
+    `best_flights` comes first because Google has already judged those the
+    strongest matches; `other_flights` is the long tail. Ranking re-sorts them
+    anyway, but a stable, meaningful order matters when the caller only takes
+    the first few.
+    """
+    results: list[SerpApiItinerary] = []
+
+    for option in (payload.get("best_flights") or []) + (
+        payload.get("other_flights") or []
+    ):
+        segments = [_segment_from_serpapi(f) for f in option.get("flights") or []]
+        if not segments:
+            continue
+
+        raw_price = option.get("price")
+        try:
+            price = float(raw_price)
+        except (TypeError, ValueError):
+            # Google omits the price on itineraries it cannot currently sell.
+            # A guessed price would flow straight into the budget, so skip it.
+            logger.warning(
+                "skipping SerpAPI itinerary with unusable price %r", raw_price
+            )
+            continue
+
+        total_duration = option.get("total_duration")
+        if not isinstance(total_duration, int):
+            legs = [s.duration_minutes for s in segments if s.duration_minutes]
+            layovers = [
+                lay.get("duration")
+                for lay in option.get("layovers") or []
+                if isinstance(lay.get("duration"), int)
+            ]
+            total_duration = sum(legs) + sum(layovers) if legs else None
+
+        results.append(
+            SerpApiItinerary(
+                slice=FlightSlice(
+                    origin=segments[0].origin,
+                    destination=segments[-1].destination,
+                    departure_at=segments[0].departure_at,
+                    arrival_at=segments[-1].arrival_at,
+                    duration_minutes=total_duration,
+                    segments=segments,
+                ),
+                price=price,
+                token=option.get("departure_token") or option.get("booking_token"),
+            )
+        )
+
+    return results
+
+
+def _airline_identity(slice_: FlightSlice) -> tuple[str, str | None]:
+    """(code, display name) for a journey that may change carrier mid-way."""
+    codes = [s.carrier_code for s in slice_.segments if s.carrier_code]
+    names = [s.carrier_name for s in slice_.segments if s.carrier_name]
+    code = codes[0] if codes else ""
+    if len(set(names)) > 1:
+        # Google labels these "Multiple airlines"; naming only the first one
+        # would misrepresent an itinerary the traveller has to change carrier on.
+        return code, "Multiple airlines"
+    return code, names[0] if names else None
+
+
+def normalize_serpapi_offers(
+    payload: dict[str, Any],
+    travelers: int = 1,
+    currency: str = "INR",
+) -> list[FlightOption]:
+    """Turn a Google Flights payload into `FlightOption` objects.
+
+    Each option covers the *outbound* direction only; `inbound` stays None
+    until the agent resolves a return leg with `departure_token`. The price is
+    already the round-trip total, so an un-resolved option costs the budget
+    correctly even though its duration counts one direction.
+
+    `offer_id` carries the provider token, which the agent needs for that
+    second call and replaces with a readable id before the option is returned.
+    """
+    resolved_currency = (
+        (payload.get("search_parameters") or {}).get("currency") or currency
+    )
+
+    options: list[FlightOption] = []
+    for itinerary in serpapi_itineraries(payload):
+        code, name = _airline_identity(itinerary.slice)
+        options.append(
+            FlightOption(
+                offer_id=itinerary.token,
+                airline=code,
+                airline_name=name,
+                outbound=itinerary.slice,
+                price=itinerary.price,
+                price_per_traveler=(
+                    round(itinerary.price / travelers, 2) if travelers > 0 else None
+                ),
+                currency=resolved_currency,
+                source="serpapi",
+            )
+        )
+
+    return options
+
+
+def flight_number_id(option: FlightOption) -> str | None:
+    """A short, human-readable id: "6E1451-6E1452".
+
+    Replaces the provider token in the returned option — the token is a
+    300-character blob that would otherwise end up in every API response and
+    every trace for no reader's benefit.
+    """
+    slices = [option.outbound] + ([option.inbound] if option.inbound else [])
+    numbers = [
+        segment.flight_number
+        for flight_slice in slices
+        for segment in flight_slice.segments
+        if segment.flight_number
+    ]
+    return "-".join(numbers) if numbers else None
 
 
 # ---------------------------------------------------------------------------
@@ -277,8 +462,14 @@ __all__ = [
     "AmadeusError",
     "FlightSearchError",
     "RANK_WEIGHTS",
+    "SerpApiClient",
+    "SerpApiError",
+    "SerpApiItinerary",
     "filter_flights",
+    "flight_number_id",
     "normalize_offers",
+    "normalize_serpapi_offers",
     "parse_iso_duration",
     "rank_flights",
+    "serpapi_itineraries",
 ]

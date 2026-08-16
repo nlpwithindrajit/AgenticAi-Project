@@ -14,6 +14,9 @@ _LIVE_KEYS = (
     "ANTHROPIC_API_KEY",
     "AMADEUS_CLIENT_ID",
     "AMADEUS_CLIENT_SECRET",
+    # SerpAPI bills per search, so a leaked key here would make `make test`
+    # cost money on every run, not merely make it slow.
+    "SERPAPI_API_KEY",
     "LANGFUSE_PUBLIC_KEY",
     "LANGFUSE_SECRET_KEY",
 )

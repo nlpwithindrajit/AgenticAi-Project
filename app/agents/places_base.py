@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 
 from app.agents.llm import build_llm
-from app.tools.amadeus import AmadeusClient, AmadeusError, PlacesSearchError
+from app.tools.amadeus import AmadeusClient, PlacesSearchError, TravelProviderError
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +37,7 @@ def resolve_anchor(
 
     try:
         payload = client.search_cities(destination)
-    except AmadeusError as exc:
+    except TravelProviderError as exc:
         raise PlacesSearchError(
             f"could not locate {destination!r}: {exc}"
         ) from exc

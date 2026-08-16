@@ -29,27 +29,30 @@ import httpx
 from app.config import get_settings
 from app.services.langfuse import observe, update_current
 
+# Re-exported: the domain errors are provider-neutral now (see
+# app/tools/errors.py), but `from app.tools.amadeus import FlightSearchError`
+# remains a valid import so nothing downstream had to move.
+from app.tools.errors import (
+    FlightSearchError,
+    HotelSearchError,
+    PlacesSearchError,
+    TravelProviderError,
+)
+
 logger = logging.getLogger(__name__)
 
 
-class AmadeusError(RuntimeError):
-    """A provider call failed. Messages never include credentials."""
+class AmadeusError(TravelProviderError):
+    """An Amadeus call failed. Messages never include credentials.
 
-
-class FlightSearchError(AmadeusError):
-    """Raised when flights cannot be searched."""
-
-
-class HotelSearchError(AmadeusError):
-    """Raised when hotels cannot be searched."""
-
-
-class PlacesSearchError(AmadeusError):
-    """Raised when activities or points of interest cannot be searched."""
+    Sits beside `FlightSearchError` and friends rather than above them: those
+    say *what* could not be searched, this says *who* failed. Catch
+    `TravelProviderError` to mean "any provider problem".
+    """
 
 
 @contextmanager
-def _as(error_type: type[AmadeusError]) -> Iterator[None]:
+def _as(error_type: type[TravelProviderError]) -> Iterator[None]:
     """Re-raise a transport-level AmadeusError as a domain-specific one.
 
     Callers catch `FlightSearchError` / `HotelSearchError`, so a bare

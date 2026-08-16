@@ -107,9 +107,13 @@ class FlightSlice(BaseModel):
 class FlightOption(BaseModel):
     """One bookable offer: outbound (+ return) at a single total price.
 
-    Amadeus returns a round trip as ONE offer carrying two itineraries, so this
-    is the unit the Budget agent must cost — summing the whole recommendation
-    list would charge the traveller for every alternative we considered.
+    A round trip is ONE offer covering both directions, so this is the unit the
+    Budget agent must cost — summing the whole recommendation list would charge
+    the traveller for every alternative we considered.
+
+    `inbound` may be None on a round trip when the provider prices the journey
+    up front but details the return leg only on a second call (SerpAPI does
+    exactly this). The price is still the round-trip total in that case.
     """
 
     offer_id: str | None = None
@@ -126,7 +130,7 @@ class FlightOption(BaseModel):
 
     score: float = 0.0
     rationale: str | None = None
-    source: Literal["amadeus", "stub"] = "amadeus"
+    source: Literal["amadeus", "serpapi", "stub"] = "amadeus"
 
     @computed_field
     @property

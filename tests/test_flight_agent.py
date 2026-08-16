@@ -8,9 +8,11 @@ import httpx
 import pytest
 
 from app.agents.flight import FlightAgent, SearchPlan
+from app.config import get_settings
 from app.models.travel import TravelRequest
-from app.tools.flights import AmadeusClient, FlightSearchError
+from app.tools.flights import AmadeusClient, FlightSearchError, SerpApiClient
 from tests.test_flights_tool import AMADEUS_PAYLOAD
+from tests.test_serpapi_tool import SERPAPI_PAYLOAD, SERPAPI_RETURN_PAYLOAD
 
 # City -> IATA answers the agent needs before it can search at all.
 _IATA = {"mumbai": "BOM", "tokyo": "NRT", "kyoto": "KIX"}
@@ -190,3 +192,239 @@ def test_agent_works_with_no_llm_at_all(sample_request: TravelRequest) -> None:
     assert result.recommendations
     assert "Deterministic plan" in result.plan.reasoning
     assert all(f.rationale for f in result.recommendations)
+
+
+# ---------------------------------------------------------------------------
+# SerpAPI path — the two-call round trip
+# ---------------------------------------------------------------------------
+
+
+def _serpapi_agent(handler, llm: object | None = None) -> FlightAgent:
+    client = SerpApiClient(
+        api_key="test-key",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    return FlightAgent(client=client, llm=llm)
+
+
+def _serpapi_handler(
+    failing_tokens: set[str] | None = None,
+    calls: list[str] | None = None,
+):
+    """Answers the outbound search, then the per-token return-leg searches."""
+    failing = failing_tokens or set()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        token = request.url.params.get("departure_token")
+        if calls is not None:
+            calls.append(token or "OUTBOUND")
+        if token is None:
+            return httpx.Response(200, json=SERPAPI_PAYLOAD)
+        if token in failing:
+            return httpx.Response(500, json={"error": "provider exploded"})
+        return httpx.Response(200, json=SERPAPI_RETURN_PAYLOAD)
+
+    return handler
+
+
+@pytest.fixture
+def return_lookups(monkeypatch):
+    """Set SERPAPI_RETURN_LOOKUPS for one test, cache-clearing either side."""
+
+    def _set(value: int) -> None:
+        monkeypatch.setenv("SERPAPI_RETURN_LOOKUPS", str(value))
+        get_settings.cache_clear()
+
+    get_settings.cache_clear()
+    yield _set
+    monkeypatch.delenv("SERPAPI_RETURN_LOOKUPS", raising=False)
+    get_settings.cache_clear()
+
+
+def test_injected_client_selects_the_provider() -> None:
+    """A stub SerpAPI client must win over whatever the environment says."""
+    assert _serpapi_agent(_serpapi_handler()).provider == "serpapi"
+    assert _agent(_ok_handler).provider == "amadeus"
+
+
+def test_serpapi_agent_completes_round_trips(
+    sample_request: TravelRequest,
+) -> None:
+    result = _serpapi_agent(_serpapi_handler()).run(sample_request)
+
+    assert result.recommendations
+    assert all(f.source == "serpapi" for f in result.recommendations)
+    best = result.recommendations[0]
+    assert best.inbound is not None, "a round trip must carry its return leg"
+    assert best.outbound.origin == "BOM"
+    assert best.inbound.origin == "DXB"
+
+
+def test_return_price_supersedes_the_outbound_estimate(
+    sample_request: TravelRequest,
+) -> None:
+    """The second call prices the specific outbound+inbound pair, and the
+    cheapest pairing (28,900) beats the 30,100 shown against the first."""
+    result = _serpapi_agent(_serpapi_handler()).run(sample_request)
+    priced = [f for f in result.recommendations if f.inbound is not None]
+
+    assert priced
+    assert all(f.price == 28900 for f in priced)
+    assert all(
+        f.price_per_traveler == round(28900 / sample_request.travelers, 2)
+        for f in priced
+    )
+
+
+def test_total_duration_counts_both_directions(
+    sample_request: TravelRequest,
+) -> None:
+    best = _serpapi_agent(_serpapi_handler()).run(sample_request).recommendations[0]
+
+    assert best.inbound is not None
+    assert best.total_duration_minutes == (
+        (best.outbound.duration_minutes or 0) + (best.inbound.duration_minutes or 0)
+    )
+    assert best.total_duration_minutes > (best.outbound.duration_minutes or 0)
+
+
+def test_one_return_search_per_shortlisted_option(
+    sample_request: TravelRequest,
+) -> None:
+    """Each completed itinerary costs a billable search — no hidden extras."""
+    calls: list[str] = []
+    _serpapi_agent(_serpapi_handler(calls=calls)).run(sample_request)
+
+    assert calls[0] == "OUTBOUND"
+    assert sorted(calls[1:]) == ["TOKEN_ETIHAD", "TOKEN_INDIGO"]
+    assert len(calls) == 3, "one outbound search plus one per shortlisted option"
+
+
+def test_lookup_budget_caps_the_number_of_second_calls(
+    sample_request: TravelRequest, return_lookups
+) -> None:
+    return_lookups(1)
+    calls: list[str] = []
+    result = _serpapi_agent(_serpapi_handler(calls=calls)).run(sample_request)
+
+    assert len(calls) == 2, "one outbound search plus a single return lookup"
+    assert len(result.recommendations) == 1
+
+
+def test_zero_lookups_skips_the_second_call_entirely(
+    sample_request: TravelRequest, return_lookups
+) -> None:
+    return_lookups(0)
+    calls: list[str] = []
+    result = _serpapi_agent(_serpapi_handler(calls=calls)).run(sample_request)
+
+    assert calls == ["OUTBOUND"]
+    assert result.recommendations
+    assert all(f.inbound is None for f in result.recommendations)
+    # The round-trip price is still correct — say what is missing, not more.
+    assert any("return legs not priced" in note for note in result.notes)
+    assert result.recommendations[0].price == 28599
+
+
+def test_failed_return_lookup_keeps_the_outbound_option(
+    sample_request: TravelRequest,
+) -> None:
+    """Losing the return detail must not lose a real flight."""
+    handler = _serpapi_handler(failing_tokens={"TOKEN_INDIGO", "TOKEN_ETIHAD"})
+    result = _serpapi_agent(handler).run(sample_request)
+
+    assert len(result.recommendations) == 2
+    assert all(f.inbound is None for f in result.recommendations)
+    assert any("not priced" in note for note in result.notes)
+
+
+def test_complete_itineraries_outrank_partial_ones(
+    sample_request: TravelRequest,
+) -> None:
+    """A missing return leg must not read as a shorter journey."""
+    handler = _serpapi_handler(failing_tokens={"TOKEN_INDIGO"})
+    result = _serpapi_agent(handler).run(sample_request)
+
+    assert result.recommendations[0].inbound is not None
+    assert result.recommendations[-1].inbound is None
+
+
+def test_offer_id_is_readable_rather_than_a_provider_token(
+    sample_request: TravelRequest,
+) -> None:
+    result = _serpapi_agent(_serpapi_handler()).run(sample_request)
+    ids = [f.offer_id for f in result.recommendations]
+
+    assert "6E1451-6E1456" in ids
+    assert not any(i and i.startswith("TOKEN_") for i in ids)
+
+
+def test_non_stop_request_reaches_both_serpapi_calls() -> None:
+    seen: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.params.get("stops"))
+        if request.url.params.get("departure_token") is None:
+            return httpx.Response(200, json=SERPAPI_PAYLOAD)
+        return httpx.Response(200, json=SERPAPI_RETURN_PAYLOAD)
+
+    request = TravelRequest(
+        origin="Mumbai",
+        destinations=["Dubai"],
+        departure_date=date(2026, 10, 10),
+        return_date=date(2026, 10, 17),
+        travelers=1,
+        budget=200000,
+        direct_flights_only=True,
+    )
+    _serpapi_agent(handler).run(request)
+
+    assert seen and all(value == "1" for value in seen)
+
+
+def test_price_cap_is_not_sent_to_the_provider(
+    sample_request: TravelRequest,
+) -> None:
+    """`filter_flights` relaxes a cap that would empty the list; SerpAPI's
+    server-side filter would just return nothing instead."""
+    seen: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.update(request.url.params)
+        if request.url.params.get("departure_token") is None:
+            return httpx.Response(200, json=SERPAPI_PAYLOAD)
+        return httpx.Response(200, json=SERPAPI_RETURN_PAYLOAD)
+
+    llm = _StubLLM(SearchPlan(max_price=1.0))
+    result = _serpapi_agent(handler, llm=llm).run(sample_request)
+
+    assert "max_price" not in seen
+    assert result.recommendations, "an impossible cap must relax, not empty the list"
+
+
+def test_serpapi_no_results_is_reported_not_raised(
+    sample_request: TravelRequest,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "error": "Google Flights hasn't returned any results for this query."
+            },
+        )
+
+    result = _serpapi_agent(handler).run(sample_request)
+    assert result.recommendations == []
+    assert any("no usable flight offers" in note for note in result.notes)
+
+
+def test_serpapi_outbound_failure_propagates(
+    sample_request: TravelRequest,
+) -> None:
+    """The graph catches this and falls back to STUB inventory."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("down")
+
+    with pytest.raises(FlightSearchError):
+        _serpapi_agent(handler).run(sample_request)

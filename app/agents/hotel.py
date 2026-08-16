@@ -18,7 +18,7 @@ from pydantic import BaseModel, Field
 
 from app.agents.llm import build_llm
 from app.models.travel import HotelOption, TravelRequest
-from app.tools.amadeus import AmadeusClient, AmadeusError, HotelSearchError
+from app.tools.amadeus import AmadeusClient, HotelSearchError, TravelProviderError
 from app.tools.hotels import (
     filter_hotels,
     normalize_hotel_offers,
@@ -230,9 +230,9 @@ class HotelAgent:
     ) -> list[HotelOption]:
         try:
             city_code = self.client.resolve_location_code(destination)
-        except AmadeusError as exc:
-            # Shared reference-data lookups raise the base error; the graph
-            # catches HotelSearchError, so convert rather than escaping it.
+        except TravelProviderError as exc:
+            # Shared reference-data lookups raise the transport error; the
+            # graph catches HotelSearchError, so convert rather than escape.
             raise HotelSearchError(
                 f"could not resolve {destination!r}: {exc}"
             ) from exc

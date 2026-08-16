@@ -16,6 +16,12 @@ Two deployment decisions differ from `projectIdea.md`:
 
 LLM provider is OpenAI (`LLM_PROVIDER=openai`, `OPENAI_API_KEY`); Anthropic remains supported via the same `app/agents/llm.py` seam.
 
+**Flights come from SerpAPI's Google Flights engine** (`SERPAPI_API_KEY`), not Amadeus — the Amadeus test tier returns non-live prices. Amadeus is still the provider for hotels, activities and points of interest, and stays selectable for flights via `FLIGHT_PROVIDER=amadeus`. Three things about SerpAPI were verified against the live API and are easy to get wrong:
+
+- **A round trip costs two searches.** The first returns outbound itineraries carrying the full round-trip price and a `departure_token`; the token buys the matching return legs. `SERPAPI_RETURN_LOOKUPS` (default 3) caps how many candidates get completed, so a trip plan spends 4 billable searches. Treat SerpAPI credits as a real budget when adding flight features.
+- **`price` is the total for all passengers**, not per person — it doubles when `adults` goes 1 → 2.
+- **Metro codes return nothing.** `LON` yields zero results where `LHR` yields twelve, and city names are rejected outright, so `app/tools/airports.py` must resolve to a specific airport. Never add a metro code to that table.
+
 ## Build Order (important)
 
 Milestones 1–8 are complete. The sequence was: foundation (FastAPI skeleton + `/plan-trip` + graph) → Flight Agent → Hotel Agent → Activity/Restaurant Agents → Budget/Itinerary/Review Agents with the replanning loop → Langfuse instrumentation → Next.js UI → containerisation and AWS deployment. The original instruction to build the graph before the frontend or deployment has been followed; it is recorded here as history, not as a remaining constraint.
@@ -43,7 +49,8 @@ app/
 ├── main.py          # FastAPI entry
 ├── graph/           # state.py, graph.py, nodes.py — LangGraph wiring
 ├── agents/          # planner, flight, hotel, activity, restaurant, budget, itinerary, reviewer
-├── tools/           # flights, hotels, places, maps — deterministic API clients
+├── tools/           # serpapi/amadeus (transport), airports, errors,
+│                 #   flights, hotels, places — deterministic API clients
 ├── services/        # langfuse.py, currency.py
 └── models/          # travel.py — Pydantic schemas (TravelRequest etc.)
 ```

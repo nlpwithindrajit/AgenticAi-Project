@@ -13,9 +13,9 @@ What is **real**:
 
 - `TravelRequest` / `TripPlan` Pydantic schemas and the shared `TravelState`
 - The full LangGraph topology, including **both feedback loops**
-- **Flights, end to end**: Amadeus Self-Service search, IATA resolution,
-  explainable filtering and ranking, and an LLM that plans the search and
-  writes the recommendation rationale
+- **Flights, end to end**: live Google Flights fares via SerpAPI, IATA
+  resolution, explainable filtering and ranking, and an LLM that plans the
+  search and writes the recommendation rationale (Amadeus stays selectable)
 - **Hotels, end to end**: Amadeus hotel list + pricing + guest ratings, a
   per-destination stay split, distance-from-centre scoring, and the same
   LLM-plans / tool-executes split
@@ -23,7 +23,7 @@ What is **real**:
   Interest, anchored on the hotel we recommended, scheduled one per day
 - **Budget, Itinerary and Review agents**, and a replanning loop that changes
   what the next pass actually searches for
-- **Langfuse tracing**: one trace per request, a span per agent, per Amadeus
+- **Langfuse tracing**: one trace per request, a span per agent, per provider
   call and per LLM call, with review and budget scores
 - **A Next.js UI** — structured trip form, budget meter, flight and hotel
   cards, day-by-day itinerary, and the plan's own caveats surfaced rather than
@@ -35,8 +35,8 @@ What is **real**:
 What is **stubbed**: transport only. It invents deterministic inventory
 labelled `STUB` so the graph runs end to end with **no API keys at all**.
 Nothing user-visible from a stub can be mistaken for a real
-search result — and when Amadeus is unconfigured or errors, every search node
-falls back to stub inventory *and says so in `TripPlan.errors`*.
+search result — and when a provider is unconfigured or errors, every search
+node falls back to stub inventory *and says so in `TripPlan.errors`*.
 
 ## Quickstart
 
@@ -90,18 +90,29 @@ python3.11 -m venv .venv
 Keep the `.venv/bin/python -m` prefix — see the troubleshooting note below.
 </details>
 
-To search **real flights, hotels, activities and restaurants**, add free
-Amadeus Self-Service credentials to `.env`:
+To search **real flights**, add a [SerpAPI](https://serpapi.com/manage-api-key)
+key to `.env`:
 
 ```bash
 cp .env.example .env
-# Set AMADEUS_CLIENT_ID and AMADEUS_CLIENT_SECRET
+# Set SERPAPI_API_KEY
 ```
 
-The Amadeus test tier has limited inventory and non-live prices, so expect
-fewer offers than production — switch `AMADEUS_BASE_URL` when you have
-production keys. `ANTHROPIC_API_KEY` is optional: without it every agent falls
-back to a deterministic search plan and rule-based explanations.
+Hotels, activities and restaurants use free
+[Amadeus Self-Service](https://developers.amadeus.com) credentials
+(`AMADEUS_CLIENT_ID` / `AMADEUS_CLIENT_SECRET`). Its test tier has limited
+inventory and non-live prices, so expect fewer offers than production — switch
+`AMADEUS_BASE_URL` when you have production keys.
+
+**SerpAPI bills per search, and one trip plan costs several.** A round trip
+needs one search for outbound itineraries plus one per candidate to price its
+return leg, so the default `SERPAPI_RETURN_LOOKUPS=3` spends 4 searches and
+returns 3 fully-priced round trips. Set it to `0` to spend one search per plan:
+the round-trip price stays correct, but results show the outbound leg only.
+
+Set `FLIGHT_PROVIDER=amadeus` to put flights back on Amadeus. An LLM key
+(`OPENAI_API_KEY` or `ANTHROPIC_API_KEY`) is optional: without it every agent
+falls back to a deterministic search plan and rule-based explanations.
 
 Then:
 
@@ -185,7 +196,8 @@ app/
 ├── graph/           # state.py, nodes.py, graph.py — LangGraph wiring
 ├── agents/          # flight, hotel, activity, restaurant,
 │                 #   budget, itinerary, reviewer — reasoning agents
-├── tools/           # amadeus.py (transport), flights, hotels, places
+├── tools/           # serpapi.py + amadeus.py (transport), airports,
+│                 #   errors, flights, hotels, places
 ├── services/        # langfuse.py — tracing (no-op without keys)
 └── models/          # travel.py — Pydantic schemas
 tests/
@@ -196,15 +208,31 @@ return structured data. No LLM calls belong in `app/tools/`.
 
 ### Flights (Milestone 2)
 
-`app/tools/flights.py` owns OAuth2, IATA lookup, the search call, normalisation
-and scoring. `app/agents/flight.py` owns the two judgement calls: which search
-parameters to use, and how to explain the winner. The agent can only recommend
-offers the provider actually returned.
+`app/tools/serpapi.py` and `app/tools/amadeus.py` own transport;
+`app/tools/flights.py` owns normalisation, filtering and scoring for both.
+`app/agents/flight.py` owns the two judgement calls: which search parameters to
+use, and how to explain the winner. The agent can only recommend offers the
+provider actually returned.
 
-A round trip is **one** Amadeus offer carrying two itineraries at a single
-price, so it maps to one `FlightOption` with an `outbound` and an `inbound`
-slice. Recommendations are therefore *alternatives*, not legs — the Budget
-agent costs only the top-ranked offer.
+A round trip maps to one `FlightOption` with an `outbound` and an `inbound`
+slice, at a single total price for all travellers. Recommendations are
+therefore *alternatives*, not legs — the Budget agent costs only the
+top-ranked offer.
+
+**SerpAPI prices a round trip in two calls.** The first returns outbound
+itineraries, each already carrying the full round-trip fare plus a
+`departure_token`; feeding that token back returns the return legs that pair
+with it. Since each token costs a billable search, the agent ranks the
+outbound-only candidates first — a fair comparison, they all share the same
+missing half — then completes only the top `SERPAPI_RETURN_LOOKUPS` and
+re-ranks those against each other. Options whose return leg could not be
+priced are kept, but sorted last, so a missing return can never read as a
+shorter journey.
+
+Google Flights rejects city names (`Mumbai` is HTTP 400) and returns *nothing*
+for metro codes (`LON` yields zero results where `LHR` yields twelve), so
+`app/tools/airports.py` resolves names to a specific airport and rewrites any
+metro code it is handed.
 
 Ranking weights, all explainable and recorded in each option's `rationale`:
 
@@ -362,8 +390,8 @@ one trace:
 plan-trip                            (chain)
 ├── planner                          (agent)
 ├── flight-agent                     (agent)
-│   ├── amadeus/v1/reference-data/locations   (tool)
-│   ├── amadeus/v2/shopping/flight-offers     (tool)
+│   ├── serpapi/google_flights                (tool)  outbound search
+│   ├── serpapi/google_flights                (tool)  return legs
 │   └── ChatAnthropic                         (generation)
 ├── hotel-agent  … activity-agent  … restaurant-agent
 ├── budget-agent
@@ -549,17 +577,24 @@ that work.
 
 ## Configuration
 
-Copy `.env.example` to `.env`. Nothing in it is required to run the graph —
-Amadeus credentials switch flights, hotels, activities and restaurants from
-stub to real. `ANTHROPIC_API_KEY` switches the seven agents from deterministic
-fallbacks to real reasoning; every one of them works without it.
+Copy `.env.example` to `.env`. Nothing in it is required to run the graph.
+`SERPAPI_API_KEY` switches flights from stub to real; Amadeus credentials do
+the same for hotels, activities and restaurants. An LLM key (`OPENAI_API_KEY`
+or `ANTHROPIC_API_KEY`) switches the seven agents from deterministic fallbacks
+to real reasoning; every one of them works without it.
+
+| Variable | Effect |
+|---|---|
+| `SERPAPI_API_KEY` | Live Google Flights fares. Billed per search. |
+| `FLIGHT_PROVIDER` | `auto` (default), `serpapi`, or `amadeus`. |
+| `SERPAPI_RETURN_LOOKUPS` | Return legs priced per plan, and so recommendations returned. Default 3 = 4 searches per plan; 0 = 1 search, outbound leg only. |
 
 ## Roadmap
 
 | # | Milestone | State |
 |---|-----------|-------|
 | 1 | Foundation — FastAPI, graph skeleton, both loops | done |
-| 2 | Flight Agent — Amadeus search, filter, rank | done |
+| 2 | Flight Agent — SerpAPI search, filter, rank | done |
 | 3 | Hotel Agent — weighted ranking (price 30 / location 25 / rating 20 / amenities 15 / prefs 10) | done |
 | 4 | Activity + Restaurant Agents | done |
 | 5 | Budget / Itinerary / Review agents + replanning loop | done |
