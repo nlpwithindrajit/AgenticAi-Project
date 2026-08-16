@@ -1,0 +1,119 @@
+name: provision-grafana
+
+# Create the read-only IAM role Grafana Cloud assumes to query CloudWatch.
+#
+# Grafana Cloud does not use an access key. Its own AWS account calls
+# sts:AssumeRole against a role in ours, and an External ID unique to our
+# Grafana org is what stops another Grafana Cloud tenant from naming the same
+# role and reading our metrics. Both values come from the CloudWatch data
+# source setup page in Grafana; neither is a secret, but the external ID is
+# only meaningful in combination with the role.
+#
+# Runs from CI because no local AWS profile authenticates to the deploy
+# account. Idempotent: an existing role has its policies updated in place,
+# matching provision-ecs.sh.
+#
+# See docs/superpowers/specs/2026-08-16-grafana-cloud-infra-monitoring-design.md
+on:
+  workflow_dispatch:
+    inputs:
+      grafana_account_id:
+        description: Grafana AWS Account ID (12 digits, from the data source page)
+        required: true
+        type: string
+      external_id:
+        description: External ID (from the same page)
+        required: true
+        type: string
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  ROLE_NAME: travelPlannerGrafanaReadOnly
+  POLICY_NAME: travelPlannerGrafanaReadOnly
+
+permissions:
+  contents: read
+  id-token: write # for the OIDC upgrade described in README.md
+
+jobs:
+  provision:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate the inputs
+        env:
+          ACCT: ${{ inputs.grafana_account_id }}
+          EXT: ${{ inputs.external_id }}
+        run: |
+          # A malformed account id produces a MalformedPolicyDocument that does
+          # not name the field, so it is worth catching before the API call.
+          if ! printf %s "$ACCT" | grep -Eq '^[0-9]{12}$'; then
+            echo "::error::grafana_account_id must be exactly 12 digits, got '$ACCT'"
+            exit 1
+          fi
+          if [ -z "$EXT" ]; then
+            echo "::error::external_id must not be empty — without it the role"
+            echo "is assumable by any Grafana Cloud tenant."
+            exit 1
+          fi
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Render the policies
+        env:
+          ACCT: ${{ inputs.grafana_account_id }}
+          EXT: ${{ inputs.external_id }}
+        run: |
+          sed -e "s|__GRAFANA_ACCOUNT_ID__|$ACCT|g" -e "s|__EXTERNAL_ID__|$EXT|g" \
+            deploy/grafana/trust-policy.json > /tmp/trust.json
+          cp deploy/grafana/readonly-policy.json /tmp/readonly.json
+          echo "trust policy:"
+          cat /tmp/trust.json
+
+      - name: Create or update the role
+        run: |
+          if aws iam get-role --role-name "$ROLE_NAME" >/dev/null 2>&1; then
+            aws iam update-assume-role-policy --role-name "$ROLE_NAME" \
+              --policy-document file:///tmp/trust.json
+            echo "updated trust policy on $ROLE_NAME"
+          else
+            aws iam create-role --role-name "$ROLE_NAME" \
+              --description "Read-only CloudWatch access for Grafana Cloud" \
+              --assume-role-policy-document file:///tmp/trust.json >/dev/null
+            echo "created $ROLE_NAME"
+          fi
+
+          # Inline rather than managed: this policy has exactly one consumer,
+          # and an inline policy cannot be attached elsewhere by accident.
+          aws iam put-role-policy --role-name "$ROLE_NAME" \
+            --policy-name "$POLICY_NAME" \
+            --policy-document file:///tmp/readonly.json
+          echo "applied $POLICY_NAME"
+
+      - name: Report the role ARN
+        run: |
+          arn=$(aws iam get-role --role-name "$ROLE_NAME" \
+            --query 'Role.Arn' --output text)
+          echo "$arn"
+          {
+            echo '## Grafana Cloud CloudWatch role'
+            echo
+            echo 'Paste this ARN into the CloudWatch data source, then press **Test**:'
+            echo
+            echo '```'
+            echo "$arn"
+            echo '```'
+            echo
+            echo "Region: \`$AWS_REGION\`"
+          } >> "$GITHUB_STEP_SUMMARY"

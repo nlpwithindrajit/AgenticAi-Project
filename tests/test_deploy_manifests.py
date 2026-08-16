@@ -137,11 +137,77 @@ def test_api_health_check_matches_the_target_group_path() -> None:
         "teardown.yml",
         "sync-secrets.yml",
         "monitoring-snapshot.yml",
+        "provision-grafana.yml",
     ],
 )
 def test_workflow_is_valid_yaml(name: str) -> None:
     parsed = yaml.safe_load((WORKFLOWS / name).read_text())
     assert parsed["jobs"], f"{name} defines no jobs"
+
+
+GRAFANA = ROOT / "deploy" / "grafana"
+
+# Verbs that only read. `Start`/`Stop` are here for logs:StartQuery and
+# logs:StopQuery, which begin and end a Logs Insights read.
+READ_ONLY_VERBS = ("Get", "List", "Describe", "Start", "Stop")
+
+
+def test_the_grafana_role_can_only_read() -> None:
+    """A monitoring role that can write is easy to create and hard to notice.
+
+    Nothing about a dashboard changes if the role behind it is over-permissive,
+    so the policy is pinned here rather than trusted to review.
+    """
+    policy = json.loads((GRAFANA / "readonly-policy.json").read_text())
+
+    actions = [
+        action
+        for statement in policy["Statement"]
+        for action in statement["Action"]
+    ]
+    assert actions, "empty policy would pass every assertion below"
+
+    for action in actions:
+        assert action != "*", "wildcard action"
+        service, _, verb = action.partition(":")
+        assert verb and verb != "*", f"service-wide wildcard: {action}"
+        assert verb.startswith(READ_ONLY_VERBS), f"not a read-only action: {action}"
+
+    for statement in policy["Statement"]:
+        assert statement["Effect"] == "Allow"
+
+
+def test_the_grafana_trust_policy_requires_an_external_id() -> None:
+    """Without the condition the role is assumable by any Grafana Cloud tenant.
+
+    That misconfiguration is invisible: the data source connects, the panels
+    render, and nothing anywhere reports that the door is open.
+    """
+    trust = json.loads(
+        (GRAFANA / "trust-policy.json")
+        .read_text()
+        .replace("__GRAFANA_ACCOUNT_ID__", "008923505280")
+        .replace("__EXTERNAL_ID__", "test-external-id")
+    )
+    statement = trust["Statement"][0]
+
+    assert statement["Action"] == "sts:AssumeRole"
+    condition = statement["Condition"]["StringEquals"]["sts:ExternalId"]
+    assert condition == "test-external-id"
+
+
+def test_the_grafana_policies_render_without_leftover_placeholders() -> None:
+    rendered = (
+        (GRAFANA / "trust-policy.json")
+        .read_text()
+        .replace("__GRAFANA_ACCOUNT_ID__", "008923505280")
+        .replace("__EXTERNAL_ID__", "abc123")
+    )
+    assert not re.findall(r"__[A-Z_]+__", rendered)
+    # The read-only policy is copied verbatim, so it must need no substitution.
+    assert not re.findall(
+        r"__[A-Z_]+__", (GRAFANA / "readonly-policy.json").read_text()
+    )
 
 
 def test_cloudwatch_dimensions_are_the_arn_suffix_not_the_whole_arn() -> None:
