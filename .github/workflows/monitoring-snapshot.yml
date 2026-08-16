@@ -1,0 +1,62 @@
+name: monitoring-snapshot
+
+# Print a CloudWatch health snapshot of the deployed stack: traffic, latency,
+# errors, target health, CPU and memory.
+#
+# Read-only, so unlike the other AWS workflows it does not share the
+# deploy-production concurrency group — there is nothing here a concurrent
+# deploy could corrupt, and blocking a diagnostic while a deploy is running is
+# exactly backwards. Watching a rollout is when you most want it.
+#
+# Exists because no local AWS profile authenticates to the deploy account, so
+# reading CloudWatch has to happen from CI.
+on:
+  workflow_dispatch:
+    inputs:
+      hours:
+        description: How many hours back to summarise
+        type: string
+        default: "3"
+
+env:
+  AWS_REGION: us-east-1
+
+permissions:
+  contents: read
+  id-token: write # for the OIDC upgrade described in README.md
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: CloudWatch snapshot
+        run: |
+          chmod +x deploy/monitoring-snapshot.sh
+          ./deploy/monitoring-snapshot.sh "${{ inputs.hours }}" | tee snapshot.txt
+
+      - name: Publish to the job summary
+        if: always()
+        run: |
+          {
+            echo '## CloudWatch snapshot'
+            echo '```'
+            cat snapshot.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: metric-data
+          path: /tmp/metric-data.json
+          if-no-files-found: warn

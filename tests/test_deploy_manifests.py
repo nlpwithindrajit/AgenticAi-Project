@@ -129,11 +129,50 @@ def test_api_health_check_matches_the_target_group_path() -> None:
 
 @pytest.mark.parametrize(
     "name",
-    ["test.yml", "deploy.yml", "provision.yml", "teardown.yml", "sync-secrets.yml"],
+    [
+        "test.yml",
+        "deploy.yml",
+        "provision.yml",
+        "teardown.yml",
+        "sync-secrets.yml",
+        "monitoring-snapshot.yml",
+    ],
 )
 def test_workflow_is_valid_yaml(name: str) -> None:
     parsed = yaml.safe_load((WORKFLOWS / name).read_text())
     assert parsed["jobs"], f"{name} defines no jobs"
+
+
+def test_the_monitoring_snapshot_cannot_change_anything() -> None:
+    """It runs with the deploy credentials, which can delete the cluster.
+
+    Its safety comes only from what it calls, so that is asserted rather than
+    trusted — a snapshot that mutates would be indistinguishable from one that
+    does not until the day it removes something.
+    """
+    script = (ROOT / "deploy" / "monitoring-snapshot.sh").read_text()
+
+    forbidden = (
+        "delete-",
+        "create-",
+        "update-",
+        "put-",
+        "register-",
+        "deregister-",
+        "modify-",
+        "terminate-",
+        "run-task",
+        "stop-",
+    )
+    # `aws elbv2 describe-...`, `aws cloudwatch get-metric-data` are the only
+    # shapes expected; anything else is a mutation waiting to happen.
+    for line in script.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("aws "):
+            continue
+        assert not any(verb in stripped for verb in forbidden), (
+            f"mutating AWS call in monitoring-snapshot.sh: {stripped}"
+        )
 
 
 def test_flight_provider_key_reaches_the_api() -> None:
