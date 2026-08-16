@@ -241,16 +241,17 @@ def _stub_flight_offers(state: TravelState) -> list[FlightOption]:
 def flight_node(state: TravelState) -> TravelState:
     """Flight agent — search -> filter -> rank -> recommend (never book).
 
-    Uses Amadeus when credentials are configured. Without them, or when the
-    provider errors, it falls back to clearly-labelled STUB inventory and
-    records why in `state["errors"]` — the graph keeps running, but nothing
-    silently passes fake flights off as a real search.
+    Uses SerpAPI (Google Flights) when its key is configured, or Amadeus when
+    `FLIGHT_PROVIDER` selects it. With neither, or when the provider errors, it
+    falls back to clearly-labelled STUB inventory and records why in
+    `state["errors"]` — the graph keeps running, but nothing silently passes
+    fake flights off as a real search.
     """
     request = state["request"]
     errors = list(state.get("errors", []))
     settings = get_settings()
 
-    if settings.amadeus_enabled:
+    if settings.flight_search_enabled:
         try:
             result = FlightAgent().run(
                 request, cost_pressure=state.get("cost_pressure", 1.0)
@@ -271,7 +272,10 @@ def flight_node(state: TravelState) -> TravelState:
             logger.exception("unexpected flight search failure")
             errors.append(f"flight search error ({exc}); using STUB inventory")
     else:
-        errors.append("Amadeus not configured; using STUB flight inventory")
+        errors.append(
+            "no flight provider configured (set SERPAPI_API_KEY); "
+            "using STUB flight inventory"
+        )
 
     ranked = rank_flights(
         _stub_flight_offers(state),

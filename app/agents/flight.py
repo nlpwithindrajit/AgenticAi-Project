@@ -5,28 +5,43 @@ writes the traveller-facing rationale; every API call, filter, and score is
 deterministic Python in `app/tools/flights.py`. The agent never invents a
 flight — its recommendations can only come from provider results.
 
-The LLM is optional. With no `ANTHROPIC_API_KEY` the agent falls back to a
-deterministic search plan and a rule-based explanation, so the graph still runs
-end to end on Amadeus credentials alone.
+Two providers sit behind the same search step. SerpAPI (Google Flights) is the
+default because it returns live fares; Amadeus remains selectable via
+`FLIGHT_PROVIDER`. They differ in one way that reaches up into this file:
+SerpAPI prices a round trip in two calls, the second keyed by a token from the
+first, so completing an itinerary costs a billable search per candidate. That
+is why only the top few candidates get their return leg resolved.
+
+The LLM is optional. With no LLM key the agent falls back to a deterministic
+search plan and a rule-based explanation, so the graph still runs end to end on
+provider credentials alone.
 """
 
 from __future__ import annotations
 
 import logging
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
 from app.agents.llm import build_llm
+from app.config import get_settings
 from app.models.travel import FlightOption, TravelRequest
 from app.tools.flights import (
     AmadeusClient,
     FlightSearchError,
+    SerpApiClient,
     filter_flights,
+    flight_number_id,
     normalize_offers,
+    normalize_serpapi_offers,
     rank_flights,
+    serpapi_itineraries,
 )
 
 logger = logging.getLogger(__name__)
+
+FlightProvider = Literal["serpapi", "amadeus"]
 
 SYSTEM_PROMPT = """You plan flight searches for a travel planner.
 
@@ -78,18 +93,41 @@ class FlightAgent:
 
     def __init__(
         self,
-        client: AmadeusClient | None = None,
+        client: AmadeusClient | SerpApiClient | None = None,
         llm: object | None = None,
+        provider: FlightProvider | None = None,
     ) -> None:
         self._client = client
         self._llm = llm
+        self._provider = provider
 
     # -- lazily-built collaborators --------------------------------------
 
     @property
-    def client(self) -> AmadeusClient:
+    def provider(self) -> FlightProvider:
+        """Which provider this agent searches with.
+
+        An injected client settles it — a caller who handed us a stub SerpAPI
+        client wants the SerpAPI path regardless of what the environment says,
+        which is what makes the agent testable without credentials.
+        """
+        if self._provider is None:
+            if self._client is not None:
+                self._provider = (
+                    "serpapi"
+                    if isinstance(self._client, SerpApiClient)
+                    else "amadeus"
+                )
+            else:
+                self._provider = get_settings().active_flight_provider or "amadeus"
+        return self._provider
+
+    @property
+    def client(self) -> AmadeusClient | SerpApiClient:
         if self._client is None:
-            self._client = AmadeusClient()
+            self._client = (
+                SerpApiClient() if self.provider == "serpapi" else AmadeusClient()
+            )
         return self._client
 
     def _get_llm(self):
@@ -179,6 +217,175 @@ class FlightAgent:
 
         return recommendations
 
+    # -- searching -------------------------------------------------------
+
+    def _search_amadeus(
+        self, request: TravelRequest, plan: SearchPlan, destination: str
+    ) -> list[FlightOption]:
+        payload = self.client.search_flights(
+            origin=request.origin,
+            destination=destination,
+            departure_date=request.departure_date,
+            return_date=request.return_date,
+            adults=request.travelers,
+            currency=request.currency,
+            non_stop=plan.non_stop,
+            max_results=plan.max_results,
+        )
+        return normalize_offers(payload, travelers=request.travelers)
+
+    def _search_serpapi(
+        self, request: TravelRequest, plan: SearchPlan, destination: str
+    ) -> list[FlightOption]:
+        """Outbound itineraries, priced at the full round-trip fare.
+
+        `plan.max_results` has no counterpart here — Google returns the set it
+        considers relevant. The cap still matters on the Amadeus path, so the
+        field stays rather than being special-cased away.
+        """
+        payload = self.client.search_flights(
+            origin=request.origin,
+            destination=destination,
+            departure_date=request.departure_date,
+            return_date=request.return_date,
+            adults=request.travelers,
+            currency=request.currency,
+            non_stop=plan.non_stop,
+        )
+        return normalize_serpapi_offers(
+            payload, travelers=request.travelers, currency=request.currency
+        )
+
+    def _with_return_leg(
+        self,
+        request: TravelRequest,
+        destination: str,
+        option: FlightOption,
+        plan: SearchPlan,
+        notes: list[str],
+    ) -> FlightOption:
+        """Resolve one option's return leg. Costs a billable provider search.
+
+        A failure degrades the option to outbound-only rather than dropping it:
+        the round-trip price is already correct, so a half-detailed real flight
+        still beats losing it.
+        """
+        token = option.offer_id
+        label = flight_number_id(option) or option.airline
+
+        def outbound_only(reason: str | None = None) -> FlightOption:
+            if reason:
+                notes.append(f"return leg for {label} not priced: {reason}")
+            return option.model_copy(update={"offer_id": flight_number_id(option)})
+
+        if not token:
+            return outbound_only("provider gave no continuation token")
+
+        try:
+            payload = self.client.search_return_legs(
+                origin=request.origin,
+                destination=destination,
+                departure_date=request.departure_date,
+                return_date=request.return_date,
+                departure_token=token,
+                adults=request.travelers,
+                currency=request.currency,
+                non_stop=plan.non_stop,
+            )
+        except FlightSearchError as exc:
+            logger.warning("return-leg lookup failed for %s: %s", label, exc)
+            return outbound_only(str(exc))
+
+        candidates = serpapi_itineraries(payload)
+        if not candidates:
+            return outbound_only("provider offered no return flights")
+
+        # Cheapest, then quickest. The price quoted here is for this specific
+        # outbound+inbound pair, so it supersedes the outbound-only estimate.
+        best = min(
+            candidates,
+            key=lambda it: (it.price, it.slice.duration_minutes or 10**6),
+        )
+        completed = option.model_copy(
+            update={
+                "inbound": best.slice,
+                "price": best.price,
+                "price_per_traveler": (
+                    round(best.price / request.travelers, 2)
+                    if request.travelers > 0
+                    else None
+                ),
+            }
+        )
+        # Recomputed after the return leg is attached so the id names both.
+        return completed.model_copy(
+            update={"offer_id": flight_number_id(completed)}
+        )
+
+    def _complete_round_trips(
+        self,
+        request: TravelRequest,
+        destination: str,
+        offers: list[FlightOption],
+        plan: SearchPlan,
+        notes: list[str],
+    ) -> list[FlightOption]:
+        """Shortlist, then buy the return-leg detail for the shortlist only.
+
+        The ordering is the point. Candidates are ranked while every one of
+        them is outbound-only — a fair comparison, since they share the same
+        missing half and already carry the true round-trip price. Only then are
+        the survivors completed and re-ranked against each other. Ranking a
+        mixed set would hand a one-way duration to whichever option happened to
+        be enriched last.
+        """
+        lookups = get_settings().serpapi_return_lookups
+
+        if lookups == 0:
+            shortlist = rank_flights(
+                offers, preferred_airline=request.preferred_airline, top_n=5
+            )
+            notes.append(
+                "return legs not priced (SERPAPI_RETURN_LOOKUPS=0): options show "
+                "the outbound leg only, at the full round-trip price"
+            )
+            return [
+                o.model_copy(update={"offer_id": flight_number_id(o)})
+                for o in shortlist
+            ]
+
+        shortlist = rank_flights(
+            offers, preferred_airline=request.preferred_airline, top_n=lookups
+        )
+        completed = [
+            self._with_return_leg(request, destination, option, plan, notes)
+            for option in shortlist
+        ]
+
+        whole = [o for o in completed if o.inbound is not None]
+        partial = [o for o in completed if o.inbound is None]
+
+        if whole:
+            notes.append(
+                f"priced complete round trips for the top {len(whole)} of "
+                f"{len(offers)} candidates that passed filtering "
+                f"({len(shortlist)} extra provider searches)"
+            )
+
+        # Complete itineraries rank among themselves and always come first:
+        # a partial one has no return duration, so mixing them in would let
+        # missing data score as speed.
+        ranked = rank_flights(
+            whole, preferred_airline=request.preferred_airline, top_n=len(whole)
+        )
+        if partial:
+            ranked += rank_flights(
+                partial,
+                preferred_airline=request.preferred_airline,
+                top_n=len(partial),
+            )
+        return ranked
+
     # -- the whole job ---------------------------------------------------
 
     def run(
@@ -211,18 +418,11 @@ class FlightAgent:
                 f"{request.destinations[-1]}"
             )
 
-        payload = self.client.search_flights(
-            origin=request.origin,
-            destination=outbound_to,
-            departure_date=request.departure_date,
-            return_date=request.return_date,
-            adults=request.travelers,
-            currency=request.currency,
-            non_stop=plan.non_stop,
-            max_results=plan.max_results,
-        )
+        if self.provider == "serpapi":
+            offers = self._search_serpapi(request, plan, outbound_to)
+        else:
+            offers = self._search_amadeus(request, plan, outbound_to)
 
-        offers = normalize_offers(payload, travelers=request.travelers)
         if not offers:
             notes.append("provider returned no usable flight offers")
             return FlightResult(plan=plan, notes=notes)
@@ -236,9 +436,14 @@ class FlightAgent:
         if request.direct_flights_only and all(f.stops > 0 for f in filtered):
             notes.append("no non-stop flights available; showing connecting options")
 
-        ranked = rank_flights(
-            filtered, preferred_airline=request.preferred_airline, top_n=5
-        )
+        if self.provider == "serpapi":
+            ranked = self._complete_round_trips(
+                request, outbound_to, filtered, plan, notes
+            )
+        else:
+            ranked = rank_flights(
+                filtered, preferred_airline=request.preferred_airline, top_n=5
+            )
         ranked = self.explain(request, ranked)
 
         return FlightResult(
@@ -249,4 +454,10 @@ class FlightAgent:
         )
 
 
-__all__ = ["FlightAgent", "FlightResult", "SearchPlan", "FlightSearchError"]
+__all__ = [
+    "FlightAgent",
+    "FlightProvider",
+    "FlightResult",
+    "FlightSearchError",
+    "SearchPlan",
+]

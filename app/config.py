@@ -93,6 +93,51 @@ class Settings(BaseSettings):
     def amadeus_enabled(self) -> bool:
         return bool(self.amadeus_client_id and self.amadeus_client_secret)
 
+    # --- SerpAPI Google Flights (flight search) --------------------------
+    serpapi_api_key: str | None = None
+    serpapi_base_url: str = "https://serpapi.com"
+    # SerpAPI scrapes Google on demand; searches routinely take 5-15s, so a
+    # short timeout fails healthy requests rather than protecting anything.
+    serpapi_timeout_seconds: float = 30.0
+
+    # Pricing a round trip needs a second billable search per candidate (see
+    # app/tools/serpapi.py), so only this many of the ranked candidates get
+    # their return leg resolved — and that is also how many recommendations
+    # come back. 0 skips the second call entirely: cheaper, but the results
+    # then show the outbound leg only.
+    serpapi_return_lookups: int = Field(default=3, ge=0, le=10)
+
+    # Which provider answers flight searches. `auto` prefers SerpAPI when its
+    # key is set, since Amadeus's free tier returns test inventory at prices
+    # that are not live.
+    flight_provider: Literal["auto", "serpapi", "amadeus"] = "auto"
+
+    @property
+    def serpapi_enabled(self) -> bool:
+        return bool(self.serpapi_api_key)
+
+    @property
+    def active_flight_provider(self) -> Literal["serpapi", "amadeus"] | None:
+        """Which provider will actually run, or None when none is usable.
+
+        An explicitly-chosen provider is never silently swapped for the other:
+        that would make a deployment quietly search somewhere the operator did
+        not pick. It reports None instead, and the graph falls back to stubs.
+        """
+        if self.flight_provider == "serpapi":
+            return "serpapi" if self.serpapi_enabled else None
+        if self.flight_provider == "amadeus":
+            return "amadeus" if self.amadeus_enabled else None
+        if self.serpapi_enabled:
+            return "serpapi"
+        if self.amadeus_enabled:
+            return "amadeus"
+        return None
+
+    @property
+    def flight_search_enabled(self) -> bool:
+        return self.active_flight_provider is not None
+
     # --- Travel APIs (Milestones 3-4) -----------------------------------
     hotel_api_key: str | None = None
     places_api_key: str | None = None
