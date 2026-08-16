@@ -305,6 +305,28 @@ def test_chat_reports_whether_a_model_was_used() -> None:
     assert body["used_llm"] is False
 
 
+@pytest.mark.parametrize(
+    ("spoken", "code"),
+    [
+        ("rupees", "INR"),
+        ("Rupee", "INR"),
+        ("dollars", "USD"),
+        ("euro", "EUR"),
+        ("pounds", "GBP"),
+        ("yen", "JPY"),
+        ("inr", "INR"),
+    ],
+)
+def test_a_spoken_currency_becomes_a_code(spoken: str, code: str) -> None:
+    """"80,000 rupees" reads back as a currency on every screen it reaches."""
+    assert TripDraft(currency=spoken).currency == code
+
+
+def test_an_unknown_currency_is_left_alone() -> None:
+    """Better an unfamiliar name than a wrong code on every price."""
+    assert TripDraft(currency="Swiss francs").currency == "Swiss francs"
+
+
 def test_draft_merge_ignores_blanks() -> None:
     base = TripDraft(origin="Mumbai", budget=1000)
     merged = base.merge(TripDraft(origin=None, destinations=["Tokyo"]))

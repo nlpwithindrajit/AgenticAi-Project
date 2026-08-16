@@ -29,12 +29,28 @@ import logging
 import re
 from datetime import date, timedelta
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from app.agents.llm import build_llm
 from app.models.travel import TravelRequest, TripStyle
 
 logger = logging.getLogger(__name__)
+
+# Singular forms — the validator strips a trailing "s" before looking up.
+_SPOKEN_CURRENCIES = {
+    "rupee": "INR",
+    "inr": "INR",
+    "dollar": "USD",
+    "us dollar": "USD",
+    "usd": "USD",
+    "euro": "EUR",
+    "eur": "EUR",
+    "pound": "GBP",
+    "pound sterling": "GBP",
+    "gbp": "GBP",
+    "yen": "JPY",
+    "jpy": "JPY",
+}
 
 SYSTEM_PROMPT = """You read a traveller's message and fill in a trip request.
 
@@ -45,7 +61,7 @@ Guessing one of those silently changes every search that follows.
 Resolve relative dates ("next month", "the first week of June") against the \
 reference date you are given. Amounts may be written as "2 lakh", "₹2,00,000" \
 or "200k" — normalise them to a plain number, and record the currency \
-separately.
+separately as an ISO 4217 code ("rupees" is INR, "$" is USD).
 
 This is one turn of a conversation, so you are shown what is already known and \
 which question the traveller was just asked. Read a bare reply as the answer to \
@@ -75,6 +91,21 @@ class TripDraft(BaseModel):
     interests: list[str] = Field(default_factory=list)
     dietary_preferences: list[str] = Field(default_factory=list)
     trip_style: TripStyle | None = None
+
+    @field_validator("currency")
+    @classmethod
+    def _as_currency_code(cls, value: str | None) -> str | None:
+        """"rupees" -> "INR". Every price is printed with this string.
+
+        The prompt asks for a code, but a traveller writes "80,000 rupees" and a
+        model will happily pass that through, so the guarantee is made here
+        rather than hoped for. An unrecognised name is kept as-is: an unfamiliar
+        word next to a number is better than a confidently wrong code.
+        """
+        if value is None:
+            return None
+        spoken = value.strip().lower().rstrip("s")
+        return _SPOKEN_CURRENCIES.get(spoken, value.strip())
 
     def merge(self, other: TripDraft) -> TripDraft:
         """Later turns win, but never overwrite a known value with a blank."""
