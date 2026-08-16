@@ -128,11 +128,54 @@ def test_api_health_check_matches_the_target_group_path() -> None:
 
 
 @pytest.mark.parametrize(
-    "name", ["test.yml", "deploy.yml", "provision.yml", "teardown.yml"]
+    "name",
+    ["test.yml", "deploy.yml", "provision.yml", "teardown.yml", "sync-secrets.yml"],
 )
 def test_workflow_is_valid_yaml(name: str) -> None:
     parsed = yaml.safe_load((WORKFLOWS / name).read_text())
     assert parsed["jobs"], f"{name} defines no jobs"
+
+
+def test_flight_provider_key_reaches_the_api() -> None:
+    """Without this the deployed API silently serves STUB flights.
+
+    It fails open by design — a missing key is a note in TripPlan.errors, not
+    a crash — which is exactly why nothing else would catch the omission.
+    """
+    api = json.loads(render(ECS / "task-def-api.json"))
+    secrets = {
+        s["name"]: s["valueFrom"]
+        for container in api["containerDefinitions"]
+        for s in container.get("secrets", [])
+    }
+    assert "SERPAPI_API_KEY" in secrets
+    assert secrets["SERPAPI_API_KEY"].endswith(
+        "parameter/travel-planner/SERPAPI_API_KEY"
+    )
+
+
+def test_every_referenced_secret_is_actually_synced() -> None:
+    """A task definition can reference an SSM parameter nobody ever writes.
+
+    ECS then refuses to start the task with a ResourceNotFound the service
+    events bury, so the two lists are pinned together here instead.
+    """
+    referenced = {
+        s["name"]
+        for path in TASK_DEFS
+        for container in json.loads(render(path))["containerDefinitions"]
+        for s in container.get("secrets", [])
+    }
+    sync = (WORKFLOWS / "sync-secrets.yml").read_text()
+    provision = (ROOT / "deploy" / "provision-ecs.sh").read_text()
+
+    missing_sync = {n for n in referenced if f"put {n} " not in sync}
+    assert not missing_sync, f"referenced but never synced: {missing_sync}"
+
+    missing_provision = {n for n in referenced if f"put_secret {n} " not in provision}
+    assert not missing_provision, (
+        f"referenced but not seeded by provision-ecs.sh: {missing_provision}"
+    )
 
 
 def test_deploy_cannot_run_without_the_test_suite() -> None:

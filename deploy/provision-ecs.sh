@@ -78,6 +78,7 @@ put_secret() {
     --value "$value" --overwrite >/dev/null
   echo "  /$PROJECT/$name set"
 }
+put_secret SERPAPI_API_KEY "${SERPAPI_API_KEY:-}"
 put_secret OPENAI_API_KEY "${OPENAI_API_KEY:-}"
 put_secret LANGFUSE_PUBLIC_KEY "${LANGFUSE_PUBLIC_KEY:-}"
 put_secret LANGFUSE_SECRET_KEY "${LANGFUSE_SECRET_KEY:-}"
