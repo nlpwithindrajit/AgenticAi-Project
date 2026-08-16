@@ -47,8 +47,14 @@ reference date you are given. Amounts may be written as "2 lakh", "₹2,00,000" 
 or "200k" — normalise them to a plain number, and record the currency \
 separately.
 
-If something required is missing, say so in `follow_up` as one short question \
-asking for the most important missing item only."""
+This is one turn of a conversation, so you are shown what is already known and \
+which question the traveller was just asked. Read a bare reply as the answer to \
+that question: "London" after "where are you travelling from?" is an origin, \
+not a destination. Return only the fields this message adds — repeating what is \
+already known is harmless, contradicting it is not.
+
+Do not ask a question. The next question is chosen from what is still missing \
+once your answer is merged in."""
 
 # The four things no downstream agent can work without.
 REQUIRED = ("origin", "destinations", "departure_date", "budget")
@@ -69,9 +75,6 @@ class TripDraft(BaseModel):
     interests: list[str] = Field(default_factory=list)
     dietary_preferences: list[str] = Field(default_factory=list)
     trip_style: TripStyle | None = None
-    follow_up: str | None = Field(
-        default=None, description="One question asking for the most important gap."
-    )
 
     def merge(self, other: TripDraft) -> TripDraft:
         """Later turns win, but never overwrite a known value with a blank."""
@@ -290,6 +293,38 @@ _QUESTIONS = {
 }
 
 
+def _next_question(missing: list[str]) -> str:
+    """The one question worth asking, chosen from the *merged* draft.
+
+    Deliberately not the model's own suggestion. The model sees a single
+    message, so its idea of what is missing is the gap in that sentence rather
+    than the gap in the conversation — which is how the chat used to ask for a
+    destination that had been given three turns earlier, forever.
+    """
+    return _QUESTIONS.get(missing[0], "Could you tell me a little more?")
+
+
+def _context(known: TripDraft) -> str:
+    """What the model needs to read a bare reply correctly."""
+    filled = {
+        key: value
+        for key, value in known.model_dump(mode="json").items()
+        if value not in (None, [], "")
+    }
+    if not filled:
+        return "Nothing is known about this trip yet; this is the first message."
+
+    missing = known.missing
+    lines = [
+        "Already known (do not contradict without being told to):",
+        *(f"  {key}: {value}" for key, value in filled.items()),
+        f"Still needed: {', '.join(missing) if missing else 'nothing'}.",
+    ]
+    if missing:
+        lines.append(f'You just asked the traveller: "{_next_question(missing)}"')
+    return "\n".join(lines)
+
+
 class IntakeResult(BaseModel):
     draft: TripDraft
     request: TravelRequest | None = None
@@ -308,13 +343,16 @@ class IntakeAgent:
         self._llm = build_llm(self._llm)
         return self._llm
 
-    def _extract(self, message: str, today: date) -> tuple[TripDraft, bool]:
+    def _extract(
+        self, message: str, today: date, known: TripDraft
+    ) -> tuple[TripDraft, bool]:
         llm = self._get_llm()
         if llm is None:
             return extract_deterministically(message, today), False
 
         prompt = (
             f"Today is {today.isoformat()}.\n\n"
+            f"{_context(known)}\n\n"
             f"Traveller's message:\n{message}"
         )
         try:
@@ -337,16 +375,17 @@ class IntakeAgent:
     ) -> IntakeResult:
         """Merge one more message into the draft and report what is still needed."""
         today = today or date.today()
-        fresh, used_llm = self._extract(message, today)
-        merged = (draft or TripDraft()).merge(fresh)
+        known = draft or TripDraft()
+        fresh, used_llm = self._extract(message, today, known)
+        merged = known.merge(fresh)
 
         missing = merged.missing
         if missing:
-            question = fresh.follow_up or _QUESTIONS.get(
-                missing[0], "Could you tell me a little more?"
-            )
             return IntakeResult(
-                draft=merged, reply=question, missing=missing, used_llm=used_llm
+                draft=merged,
+                reply=_next_question(missing),
+                missing=missing,
+                used_llm=used_llm,
             )
 
         request = merged.to_request()
