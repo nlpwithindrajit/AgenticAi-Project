@@ -58,7 +58,11 @@ tg_dim() {
   local arn
   arn=$(aws elbv2 describe-target-groups --names "$1" --region "$REGION" \
     --query 'TargetGroups[0].TargetGroupArn' --output text 2>/dev/null || true)
-  [ -n "$arn" ] && [ "$arn" != "None" ] && echo "${arn#*:}" || echo ""
+  # The dimension is the ARN's trailing `targetgroup/<name>/<id>`, so strip
+  # through the LAST colon (`##`), not the first (`#`). Getting this wrong
+  # yields a syntactically valid query that silently returns no data rather
+  # than an error — which reads as "the service is down" on a dashboard.
+  [ -n "$arn" ] && [ "$arn" != "None" ] && echo "${arn##*:}" || echo ""
 }
 API_TG=$(tg_dim "$PROJECT-api-tg")
 UI_TG=$(tg_dim "$PROJECT-ui-tg")

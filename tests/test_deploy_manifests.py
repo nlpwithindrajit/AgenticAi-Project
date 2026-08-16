@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -141,6 +142,31 @@ def test_api_health_check_matches_the_target_group_path() -> None:
 def test_workflow_is_valid_yaml(name: str) -> None:
     parsed = yaml.safe_load((WORKFLOWS / name).read_text())
     assert parsed["jobs"], f"{name} defines no jobs"
+
+
+def test_cloudwatch_dimensions_are_the_arn_suffix_not_the_whole_arn() -> None:
+    """This shipped broken once, and nothing looked wrong.
+
+    A CloudWatch dimension of the wrong shape is still a valid query — it just
+    matches no metric, so `HealthyHostCount` came back empty and read exactly
+    like a service with no healthy targets. `${arn#*:}` strips only "arn:";
+    the dimension needs everything after the LAST colon.
+    """
+    arn = (
+        "arn:aws:elasticloadbalancing:us-east-1:024899754281:"
+        "targetgroup/travel-planner-api-tg/0123456789abcdef"
+    )
+    extracted = subprocess.run(
+        ["bash", "-c", f'arn="{arn}"; printf %s "${{arn##*:}}"'],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    assert extracted == "targetgroup/travel-planner-api-tg/0123456789abcdef"
+
+    script = (ROOT / "deploy" / "monitoring-snapshot.sh").read_text()
+    assert "${arn##*:}" in script, "target group dimension must strip to the suffix"
+    assert "${arn#*:}" not in script, "single # leaves the whole ARN minus 'arn:'"
 
 
 def test_the_monitoring_snapshot_cannot_change_anything() -> None:
